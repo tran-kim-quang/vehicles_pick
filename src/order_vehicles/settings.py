@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     exact_model: bool = False
     host: str = "127.0.0.1"
     port: int = 8000
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_api_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
+    llm_structured_output: bool = False
+    llm_timeout_seconds: float = 30
 
     @field_validator("voicestudio_url")
     @classmethod
@@ -41,6 +46,6 @@ class Settings(BaseSettings):
 
     def safe_dict(self) -> dict[str, Any]:
         result = self.model_dump(mode="json")
-        for name in ("voicestudio_api_key", "management_token"):
+        for name in ("voicestudio_api_key", "management_token", "llm_api_key"):
             result[name] = "**********" if getattr(self, name).get_secret_value() else ""
         return result
