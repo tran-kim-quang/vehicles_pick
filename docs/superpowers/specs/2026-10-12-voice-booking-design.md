@@ -1,6 +1,6 @@
 # Thiết kế MVP hội thoại đặt xe bằng micro với Python
 
-Ngày: 2026-10-12. Trạng thái: đã được người dùng duyệt ngày 2026-10-12; chưa triển khai sản phẩm.
+Ngày: 2026-10-12. Trạng thái: đã được người dùng duyệt và triển khai MVP trên nhánh `feat/voice-booking-mvp` ngày 2026-10-12; live inference/micro cần môi trường model và thiết bị để kiểm chứng.
 
 ## 1. Mục tiêu và phạm vi đã thống nhất
 

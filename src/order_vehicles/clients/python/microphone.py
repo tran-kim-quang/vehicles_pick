@@ -1,10 +1,12 @@
 import asyncio
 import sys
+import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from uuid import uuid4
 
 from order_vehicles.speech.domain.models import AudioFormat, AudioPacket
+from order_vehicles.observability.timing import TurnTiming
 
 from .audio import AudioInputOverflow, SoundDeviceInput
 from .playback import SoundDeviceOutput
@@ -24,6 +26,8 @@ class PythonMicClient:
         writer: AtomicBookingWriter,
         turn_controller=None,
         push_to_talk_commands=None,
+        timing_recorder=None,
+        monotonic=time.perf_counter,
         echo=print,
     ) -> None:
         self.input_source = input_source or SoundDeviceInput()
@@ -32,6 +36,13 @@ class PythonMicClient:
         self.writer = writer
         self.turn_controller = turn_controller or TurnController(EnergyVAD())
         self.push_to_talk_commands = push_to_talk_commands
+        self.timing_recorder = timing_recorder
+        self.monotonic = monotonic
+        self._client_timings: dict[str, TurnTiming] = {}
+        self._session_id: str | None = None
+        self._session_ready = asyncio.Event()
+        if hasattr(self.output, "on_first_audio"):
+            self.output.on_first_audio = self._mark_playback_started
         self.echo = echo
 
     async def run(
@@ -93,6 +104,7 @@ class PythonMicClient:
                     await socket.close()
 
     async def _capture(self, socket, push_to_talk: bool) -> None:
+        await self._session_ready.wait()
         if push_to_talk:
             await self._capture_push_to_talk(socket)
             return
@@ -102,22 +114,25 @@ class PythonMicClient:
                 for event in self.turn_controller.feed(frame):
                     if event.kind == "start":
                         self.output.clear()
-                        await socket.send_json({"type": "response.interrupt"})
+                        await self._send_event(socket, {"type": "response.interrupt"})
                         turn_id = str(uuid4())
-                        await socket.send_json(
+                        await self._send_event(
+                            socket,
                             {"type": "input_audio.start", "turn_id": turn_id}
                         )
                     elif event.kind == "frame" and event.pcm is not None:
                         await socket.send_bytes(event.pcm)
                     elif event.kind == "end" and turn_id:
-                        await socket.send_json(
+                        await self._send_event(
+                            socket,
                             {"type": "input_audio.end", "turn_id": turn_id}
                         )
                         turn_id = None
         except AudioInputOverflow:
             self.turn_controller.overflow()
             if turn_id:
-                await socket.send_json(
+                await self._send_event(
+                    socket,
                     {"type": "input_audio.end", "turn_id": turn_id}
                 )
             self.echo("Audio đầu vào bị tràn; vui lòng nói lại.")
@@ -143,13 +158,15 @@ class PythonMicClient:
                     command_task = asyncio.create_task(anext(commands))
                     if command == "start" and turn_id is None:
                         self.output.clear()
-                        await socket.send_json({"type": "response.interrupt"})
+                        await self._send_event(socket, {"type": "response.interrupt"})
                         turn_id = str(uuid4())
-                        await socket.send_json(
+                        await self._send_event(
+                            socket,
                             {"type": "input_audio.start", "turn_id": turn_id}
                         )
                     elif command == "end" and turn_id is not None:
-                        await socket.send_json(
+                        await self._send_event(
+                            socket,
                             {"type": "input_audio.end", "turn_id": turn_id}
                         )
                         turn_id = None
@@ -205,7 +222,12 @@ class PythonMicClient:
                     )
                 continue
             event_type = event.get("type")
-            if event_type == "assistant.audio.start":
+            if event_type == "session.started":
+                self._session_id = event["session_id"]
+                self._session_ready.set()
+            elif event_type in {"transcript.partial", "transcript.final"}:
+                self.echo(event.get("text", ""))
+            elif event_type == "assistant.audio.start":
                 audio_format = AudioFormat.model_validate(event["format"])
                 if state["output_format"] is None:
                     await self.output.open(audio_format, output_device)
@@ -213,6 +235,9 @@ class PythonMicClient:
                     raise RuntimeError("TTS audio format changed within the session")
                 state["output_format"] = audio_format
                 state["response_id"] = event["response_id"]
+                timing = TurnTiming(clock_domain="client")
+                timing.mark("audio.received", self.monotonic())
+                self._client_timings[event["response_id"]] = timing
             elif event_type == "assistant.audio.end":
                 response_id = event["response_id"]
                 self.output.end_response(response_id)
@@ -232,9 +257,18 @@ class PythonMicClient:
             elif event_type == "error":
                 self.echo(f"Lỗi {event.get('code')}: {event.get('message')}")
 
+    def _mark_playback_started(self, response_id: str, at: float) -> None:
+        timing = self._client_timings.pop(response_id, None)
+        if timing is None:
+            return
+        timing.mark("playback.first_audio", at)
+        if self.timing_recorder:
+            self.timing_recorder.record(timing, {})
+
     async def _playback_ack(self, socket, state, done) -> None:
         async for response_id in self.output.finished():
-            await socket.send_json(
+            await self._send_event(
+                socket,
                 {
                     "type": "assistant.playback.finished",
                     "response_id": response_id,
@@ -243,3 +277,8 @@ class PythonMicClient:
             if response_id == state["confirmed_response"]:
                 done.set()
                 return
+
+    async def _send_event(self, socket, event: dict) -> None:
+        if self._session_id:
+            event = {**event, "session_id": self._session_id}
+        await socket.send_json(event)

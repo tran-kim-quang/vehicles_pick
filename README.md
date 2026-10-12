@@ -37,4 +37,4 @@ uv run ov mic
 
 Client gửi PCM16 mono 16 kHz, phát đúng sample rate server trả về, hỗ trợ barge-in bằng cách xóa audio cũ trước khi mở lượt nói mới, và chỉ ghi `outputs/<request_id>.json` sau sự kiện xác nhận. Dùng tai nghe để barge-in ổn định vì MVP chưa có acoustic echo cancellation cho loa ngoài.
 
-Các bước chuẩn bị model, clone/preview và smoke test nằm tại [speech provider runbook](docs/runbooks/speech-provider.md).
+Các bước chuẩn bị model, clone/preview và smoke test nằm tại [speech provider runbook](docs/runbooks/speech-provider.md). Quy trình chạy hội thoại, xác nhận JSON, kiểm tra barge-in và đo timing nằm tại [voice booking runbook](docs/runbooks/voice-booking.md).

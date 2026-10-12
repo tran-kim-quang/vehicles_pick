@@ -59,3 +59,16 @@ def test_websocket_route_delegates_to_voice_service(tmp_path) -> None:
     with TestClient(app).websocket_connect("/v1/voice/sessions") as socket:
         socket.send_json({"type": "hello"})
         assert socket.receive_json() == {"type": "echo", "value": "hello"}
+
+
+def test_timing_endpoint_returns_safe_aggregate(tmp_path) -> None:
+    class Recorder:
+        def summary(self):
+            return {"server": {"stt_seconds": {"count": 2, "p50": 0.2, "p95": 0.3}}}
+
+    app = create_app(
+        Settings(state_dir=tmp_path / "state", output_dir=tmp_path / "output"),
+        {"timings": Recorder()},
+    )
+    response = TestClient(app).get("/v1/voice/timings")
+    assert response.json()["server"]["stt_seconds"]["p95"] == 0.3

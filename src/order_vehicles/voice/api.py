@@ -1,9 +1,19 @@
 import json
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect
+
+from order_vehicles.speech.api.dependencies import require_management_token
 
 
 router = APIRouter()
+
+
+@router.get(
+    "/v1/voice/timings", dependencies=[Depends(require_management_token)]
+)
+async def voice_timings(request: Request) -> dict:
+    recorder = request.app.state.services.get("timings")
+    return recorder.summary() if recorder else {}
 
 
 class FastAPISessionSocket:

@@ -1,5 +1,6 @@
 import asyncio
 import secrets
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from datetime import datetime
@@ -11,6 +12,7 @@ from pydantic import ValidationError
 from order_vehicles.booking.dialogue import DialogueDecision, DialogueManager
 from order_vehicles.booking.models import CallSession
 from order_vehicles.booking.repository import SessionRepository
+from order_vehicles.observability.timing import TurnTiming
 from order_vehicles.speech.domain.errors import SpeechError
 
 from .protocol import (
@@ -39,8 +41,14 @@ class _SerializedWriter:
     def __init__(self, socket: SessionSocket) -> None:
         self.socket = socket
         self.lock = asyncio.Lock()
+        self.session_id: str | None = None
+
+    def bind_session(self, session_id) -> None:
+        self.session_id = str(session_id)
 
     async def json(self, value: dict) -> None:
+        if self.session_id and "session_id" not in value:
+            value = {**value, "session_id": self.session_id}
         async with self.lock:
             await self.socket.send_json(value)
 
@@ -58,12 +66,16 @@ class VoiceSessionService:
         extractor,
         *,
         clock: Callable[[], datetime],
+        timing_recorder=None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.runtime_service = runtime_service
         self.repository = repository
         self.dialogue = dialogue
         self.extractor = extractor
         self.clock = clock
+        self.timing_recorder = timing_recorder
+        self.monotonic = monotonic
         self._connections: set[_VoiceConnection] = set()
 
     @property
@@ -77,6 +89,8 @@ class VoiceSessionService:
             self.dialogue,
             self.extractor,
             clock=self.clock,
+            timing_recorder=self.timing_recorder,
+            monotonic=self.monotonic,
         )
         self._connections.add(connection)
         try:
@@ -94,15 +108,21 @@ class _VoiceConnection:
         extractor,
         *,
         clock: Callable[[], datetime],
+        timing_recorder=None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.runtime_service = runtime_service
         self.repository = repository
         self.dialogue = dialogue
         self.extractor = extractor
         self.clock = clock
+        self.timing_recorder = timing_recorder
+        self.monotonic = monotonic
         self._background: set[asyncio.Task] = set()
         self._responses = ResponseTasks()
         self._generation = 0
+        self._timings: dict[int, TurnTiming] = {}
+        self._turn_ids: dict[int, str] = {}
 
     @property
     def active_task_count(self) -> int:
@@ -132,6 +152,7 @@ class _VoiceConnection:
                 await socket.close(code=1008)
                 return
 
+            writer.bind_session(session.session_id)
             await writer.json(
                 {
                     "type": "session.started",
@@ -185,6 +206,14 @@ class _VoiceConnection:
                     except ValidationError as exc:
                         await self._error(writer, "INVALID_EVENT", str(exc))
                         continue
+                    event_session_id = getattr(event, "session_id", None)
+                    if event_session_id and event_session_id != session.session_id:
+                        await self._error(
+                            writer,
+                            "SESSION_ID_MISMATCH",
+                            "Event session_id does not match this socket",
+                        )
+                        continue
 
                     if isinstance(event, InputAudioStart):
                         if frames is not None:
@@ -194,6 +223,8 @@ class _VoiceConnection:
                         turn_id = event.turn_id
                         frames = asyncio.Queue(maxsize=100)
                         generation = self._generation
+                        self._turn_ids[generation] = event.turn_id
+                        self._timings[generation] = TurnTiming(clock_domain="server")
                         self._track(
                             self._transcribe_turn(
                                 runtime, writer, session, frames, generation
@@ -204,6 +235,9 @@ class _VoiceConnection:
                             await self._error(writer, "INPUT_TURN_MISMATCH", "Input turn is not active")
                             continue
                         await frames.put(None)
+                        timing = self._timings.get(self._generation)
+                        if timing:
+                            timing.mark("input.end", self.monotonic())
                         frames = None
                         turn_id = None
                     elif isinstance(event, ResponseInterrupt):
@@ -251,13 +285,17 @@ class _VoiceConnection:
                     return
                 await writer.json(
                     {
-                        "type": "transcript",
+                        "type": f"transcript.{event.kind}",
                         "kind": event.kind,
                         "final_kind": event.final_kind,
                         "text": event.text,
+                        "turn_id": self._turn_ids.get(generation),
                     }
                 )
                 if event.kind == "final" and event.final_kind == "summary":
+                    timing = self._timings.get(generation)
+                    if timing:
+                        timing.mark("stt.final", self.monotonic())
                     await self._process_summary(
                         runtime, writer, session, event.text, generation
                     )
@@ -282,6 +320,9 @@ class _VoiceConnection:
                 return
             expected_revision = session.revision
             decision = self.dialogue.handle(session, result, self.clock())
+            timing = self._timings.get(generation)
+            if timing:
+                timing.mark("llm.first_text", self.monotonic())
             if generation != self._generation:
                 return
             self.repository.save(session, expected_revision=expected_revision)
@@ -336,9 +377,18 @@ class _VoiceConnection:
             {
                 "type": "assistant.response.started",
                 "response_id": response_id,
+                "turn_id": self._turn_ids.get(generation),
                 "text": decision.text,
                 "field": decision.field,
                 "confirmation": confirmation,
+            }
+        )
+        await writer.json(
+            {
+                "type": "assistant.text",
+                "response_id": response_id,
+                "turn_id": self._turn_ids.get(generation),
+                "text": decision.text,
             }
         )
         started_audio = False
@@ -346,10 +396,14 @@ class _VoiceConnection:
             if generation != self._generation:
                 return
             if not started_audio:
+                timing = self._timings.get(generation)
+                if timing:
+                    timing.mark("tts.first_audio", self.monotonic())
                 await writer.json(
                     {
                         "type": "assistant.audio.start",
                         "response_id": response_id,
+                        "turn_id": self._turn_ids.get(generation),
                         "format": packet.format.model_dump(),
                     }
                 )
@@ -360,13 +414,32 @@ class _VoiceConnection:
                 {
                     "type": "assistant.audio.end",
                     "response_id": response_id,
+                    "turn_id": self._turn_ids.get(generation),
                     "confirmation": confirmation,
                 }
             )
+            timing = self._timings.pop(generation, None)
+            if timing and self.timing_recorder:
+                profile = getattr(runtime, "profile", None)
+                self.timing_recorder.record(
+                    timing,
+                    {
+                        "profile_revision": getattr(profile, "revision", None),
+                        "engine": getattr(
+                            getattr(profile, "tts", None), "engine_id", None
+                        ),
+                        "model": getattr(
+                            getattr(profile, "tts", None), "model_id", None
+                        ),
+                    },
+                )
 
     async def _interrupt(self, writer: _SerializedWriter) -> None:
         old_response = self._responses.response_id
+        old_generation = self._generation
         self._generation += 1
+        self._timings.pop(old_generation, None)
+        self._turn_ids.pop(old_generation, None)
         await self._responses.interrupt()
         if old_response:
             await writer.json(
@@ -386,6 +459,8 @@ class _VoiceConnection:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._background.clear()
+        self._timings.clear()
+        self._turn_ids.clear()
 
     @staticmethod
     async def _error(

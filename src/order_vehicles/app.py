@@ -12,6 +12,7 @@ from order_vehicles.booking.fields import FieldRegistry
 from order_vehicles.booking.repository import SessionRepository
 from order_vehicles.llm.client import ChatCompletionsLLMAdapter
 from order_vehicles.llm.extractor import InformationExtractor
+from order_vehicles.observability.timing import TimingRecorder
 from order_vehicles.speech.api import models as model_routes
 from order_vehicles.speech.api import profiles as profile_routes
 from order_vehicles.speech.api import voices as voice_routes
@@ -134,13 +135,16 @@ def _services(settings: Settings, overrides: dict[str, object]):
             timeout=settings.llm_timeout_seconds,
         )
         services["llm"] = adapter
-        fields = FieldRegistry()
+        fields = FieldRegistry(timezone_name=settings.service_timezone)
+        timings = TimingRecorder()
+        services["timings"] = timings
         services["voice_sessions"] = VoiceSessionService(
             runtime,
-            SessionRepository(["bike", "car"]),
+            SessionRepository(settings.vehicles_available),
             DialogueManager(fields),
-            InformationExtractor(adapter),
-            clock=lambda: datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")),
+            InformationExtractor(adapter, timezone=settings.service_timezone),
+            clock=lambda: datetime.now(ZoneInfo(settings.service_timezone)),
+            timing_recorder=timings,
         )
     return services, client
 

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ class SoundDeviceOutput:
         device_module=None,
         resampler_factory: Callable[[int, int], object] = SoxrPCM16Resampler,
         max_seconds: float = 2.0,
+        on_first_audio=None,
+        monotonic=time.perf_counter,
     ) -> None:
         self.device_module = device_module
         self.resampler_factory = resampler_factory
@@ -37,6 +40,9 @@ class SoundDeviceOutput:
         self.finished_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.pending_ack: str | None = None
+        self.on_first_audio = on_first_audio
+        self.monotonic = monotonic
+        self.played_responses: set[str] = set()
 
     @staticmethod
     def _import_sounddevice():
@@ -126,6 +132,10 @@ class SoundDeviceOutput:
                 self.pending_ack = chunk.response_id
                 continue
             count = min(size - cursor, len(chunk.data) - chunk.offset)
+            if count and chunk.response_id not in self.played_responses:
+                self.played_responses.add(chunk.response_id)
+                if self.on_first_audio:
+                    self.on_first_audio(chunk.response_id, self.monotonic())
             output[cursor : cursor + count] = chunk.data[
                 chunk.offset : chunk.offset + count
             ]
@@ -161,4 +171,5 @@ class SoundDeviceOutput:
             self.stream.close()
             self.stream = None
         self.clear()
+        self.played_responses.clear()
         self.finished_queue.put_nowait(None)

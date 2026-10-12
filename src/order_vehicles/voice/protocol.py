@@ -31,20 +31,24 @@ class SessionResume(ProtocolModel):
 
 class InputAudioStart(ProtocolModel):
     type: Literal["input_audio.start"]
+    session_id: UUID | None = None
     turn_id: str = Field(min_length=1)
 
 
 class InputAudioEnd(ProtocolModel):
     type: Literal["input_audio.end"]
+    session_id: UUID | None = None
     turn_id: str = Field(min_length=1)
 
 
 class ResponseInterrupt(ProtocolModel):
     type: Literal["response.interrupt"]
+    session_id: UUID | None = None
 
 
 class PlaybackFinished(ProtocolModel):
     type: Literal["assistant.playback.finished"]
+    session_id: UUID | None = None
     response_id: str = Field(min_length=1)
 
 

@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     rest_timeout_seconds: float = 30
     inference_inactivity_timeout_seconds: float = 60
     max_turn_seconds: float = 30
+    service_timezone: str = "Asia/Ho_Chi_Minh"
+    vehicles_available: list[str] = Field(default_factory=lambda: ["bike", "car"])
+    vad_threshold: float = 500
     install_tracking_timeout_seconds: float = 1800
     shutdown_timeout_seconds: float = 5
     default_tts_engine: str = "omnivoice"

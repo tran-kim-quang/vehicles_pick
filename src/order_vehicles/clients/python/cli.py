@@ -11,6 +11,8 @@ from .management import ManagementClient
 from .microphone import PythonMicClient
 from .recording import record_reference
 from .results import AtomicBookingWriter
+from .turns import TurnController
+from .vad import EnergyVAD
 
 app = typer.Typer(help="Voice booking and speech management CLI")
 models_app = typer.Typer(help="Manage VoiceStudio models")
@@ -55,10 +57,18 @@ def mic(
     input_device: int | None = None,
     output_device: int | None = None,
     push_to_talk: bool = False,
+    vad_threshold: float | None = None,
 ) -> None:
     """Run the microphone booking client."""
     settings = Settings()
-    client = PythonMicClient(writer=AtomicBookingWriter(settings.output_dir))
+    threshold = settings.vad_threshold if vad_threshold is None else vad_threshold
+    client = PythonMicClient(
+        writer=AtomicBookingWriter(settings.output_dir),
+        turn_controller=TurnController(
+            EnergyVAD(threshold),
+            max_turn_ms=round(settings.max_turn_seconds * 1000),
+        ),
+    )
     try:
         asyncio.run(
             client.run(url, input_device, output_device, push_to_talk)

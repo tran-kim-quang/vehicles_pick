@@ -74,6 +74,25 @@ async def test_binary_outside_open_input_turn_is_rejected(uuid_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_event_for_another_session_is_rejected(uuid_factory) -> None:
+    svc, _ = service(FakeRuntime(), FakeExtractor([]), uuid_factory)
+    socket = FakeSocket()
+    task = asyncio.create_task(svc.run(socket))
+    await socket.push(START)
+    await socket.wait_for(lambda e: e["type"] == "session.started")
+    await socket.push(
+        {
+            "type": "response.interrupt",
+            "session_id": "00000000-0000-0000-0000-000000000099",
+        }
+    )
+    error = await socket.wait_for(lambda e: e["type"] == "error")
+    await socket.push(None)
+    await task
+    assert error["code"] == "SESSION_ID_MISMATCH"
+
+
+@pytest.mark.asyncio
 async def test_old_llm_result_after_interrupt_is_ignored(uuid_factory) -> None:
     gate = asyncio.Event()
     runtime = FakeRuntime(["Tôi là Nam"])
