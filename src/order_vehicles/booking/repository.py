@@ -21,7 +21,8 @@ class SessionRepository:
             self._sessions[session.session_id] = session.model_copy(deep=True)
             return session
 
-    def get(self, session_id: UUID) -> CallSession:
+    def get(self, session_id: UUID | str) -> CallSession:
+        session_id = UUID(str(session_id))
         with self._lock:
             try:
                 session = self._sessions[session_id].model_copy(deep=True)
@@ -42,7 +43,8 @@ class SessionRepository:
                 raise SpeechError("REVISION_CONFLICT", "Session revision changed")
             self._sessions[session.session_id] = session.model_copy(deep=True)
 
-    def detach(self, session_id: UUID, now: datetime) -> None:
+    def detach(self, session_id: UUID | str, now: datetime) -> None:
+        session_id = UUID(str(session_id))
         with self._lock:
             session = self._sessions[session_id]
             session.detached_at = now

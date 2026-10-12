@@ -1,9 +1,17 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from order_vehicles.settings import Settings
+from order_vehicles.booking.dialogue import DialogueManager
+from order_vehicles.booking.fields import FieldRegistry
+from order_vehicles.booking.repository import SessionRepository
+from order_vehicles.llm.client import ChatCompletionsLLMAdapter
+from order_vehicles.llm.extractor import InformationExtractor
 from order_vehicles.speech.api import models as model_routes
 from order_vehicles.speech.api import profiles as profile_routes
 from order_vehicles.speech.api import voices as voice_routes
@@ -11,11 +19,15 @@ from order_vehicles.speech.application.jobs import ModelJobService
 from order_vehicles.speech.application.leases import ResourceLeases
 from order_vehicles.speech.application.management import SpeechManagementService
 from order_vehicles.speech.application.profiles import JsonRuntimeProfileRepository
+from order_vehicles.speech.application.runtime import SpeechRuntimeService
 from order_vehicles.speech.domain.errors import SpeechError
 from order_vehicles.speech.providers.voicestudio.client import VoiceStudioClient
 from order_vehicles.speech.providers.voicestudio.models import VoiceStudioModelManager
+from order_vehicles.speech.providers.voicestudio.stt import VoiceStudioSTTAdapter
 from order_vehicles.speech.providers.voicestudio.tts import VoiceStudioTTSAdapter
 from order_vehicles.speech.providers.voicestudio.voices import VoiceStudioVoiceLibrary
+from order_vehicles.voice import api as voice_session_routes
+from order_vehicles.voice.session import VoiceSessionService
 
 
 def create_app(
@@ -33,6 +45,9 @@ def create_app(
         jobs = services.get("jobs")
         if jobs and hasattr(jobs, "close"):
             await jobs.close()
+        llm = services.get("llm")
+        if llm and hasattr(llm, "client"):
+            await llm.client.aclose()
         if owned_client:
             await owned_client.aclose()
 
@@ -44,6 +59,7 @@ def create_app(
     app.include_router(voice_routes.router)
     app.include_router(profile_routes.router)
     app.include_router(profile_routes.contract_router)
+    app.include_router(voice_session_routes.router)
 
     @app.exception_handler(SpeechError)
     async def speech_error_handler(request: Request, exc: SpeechError):
@@ -78,6 +94,7 @@ def _services(settings: Settings, overrides: dict[str, object]):
     client = VoiceStudioClient(settings)
     models = VoiceStudioModelManager(client)
     tts = VoiceStudioTTSAdapter(client)
+    stt = VoiceStudioSTTAdapter(client)
 
     async def clone_capability(_: str):
         engines = await models.list_engines()
@@ -89,14 +106,43 @@ def _services(settings: Settings, overrides: dict[str, object]):
     leases = ResourceLeases()
     jobs = ModelJobService(models, tracking_timeout_seconds=settings.install_tracking_timeout_seconds)
     management = SpeechManagementService(repository, leases, models, voices)
-    return {
+    async def readiness(profile):
+        await models.validate_profile(profile)
+        return True
+
+    runtime = SpeechRuntimeService(
+        repository,
+        leases,
+        {"voicestudio": (stt, tts)},
+        readiness=readiness,
+    )
+    services = {
         "models": models,
         "jobs": jobs,
         "voices": voices,
         "repository": repository,
         "leases": leases,
         "management": management,
-    }, client
+        "runtime": runtime,
+    }
+    if settings.llm_base_url and settings.llm_model:
+        adapter = ChatCompletionsLLMAdapter(
+            settings.llm_base_url,
+            settings.llm_model,
+            settings.llm_api_key.get_secret_value(),
+            structured_output=settings.llm_structured_output,
+            timeout=settings.llm_timeout_seconds,
+        )
+        services["llm"] = adapter
+        fields = FieldRegistry()
+        services["voice_sessions"] = VoiceSessionService(
+            runtime,
+            SessionRepository(["bike", "car"]),
+            DialogueManager(fields),
+            InformationExtractor(adapter),
+            clock=lambda: datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")),
+        )
+    return services, client
 
 
 app = create_app()
