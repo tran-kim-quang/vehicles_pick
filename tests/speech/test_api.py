@@ -75,8 +75,9 @@ class FakeVoices:
 
 
 class FakeManagement:
-    def __init__(self, repository, delete_error=None):
+    def __init__(self, repository, voices, delete_error=None):
         self.repository = repository
+        self.voices = voices
         self.delete_error = delete_error
 
     async def update_profile(self, profile, expected_revision):
@@ -85,6 +86,10 @@ class FakeManagement:
     async def delete_voice(self, ref):
         if self.delete_error:
             raise self.delete_error
+
+    async def preview_voice(self, ref, text, config):
+        async for packet in self.voices.preview_voice(ref, text, config):
+            yield packet
 
 
 def app_client(tmp_path, *, token="", jobs=None, delete_error=None):
@@ -95,7 +100,7 @@ def app_client(tmp_path, *, token="", jobs=None, delete_error=None):
     voices = FakeVoices()
     app = create_app(settings, {
         "models": FakeModels(), "jobs": jobs or FakeJobs(), "voices": voices,
-        "repository": repository, "management": FakeManagement(repository, delete_error),
+        "repository": repository, "management": FakeManagement(repository, voices, delete_error),
     })
     return TestClient(app), voices
 

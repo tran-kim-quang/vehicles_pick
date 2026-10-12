@@ -27,26 +27,31 @@ class SpeechManagementService:
     async def update_profile(
         self, profile: RuntimeProfile, expected_revision: int
     ) -> RuntimeProfile:
-        await self.leases.assert_mutable("global:selection")
-        for requested in (profile.stt, profile.tts):
-            actual = await self.models.select_model(requested)
-            actual_engine = actual.get("backend_id") or actual.get("engine_id")
-            actual_model = actual.get("model_id")
-            if actual_engine and actual_engine != requested.engine_id:
-                raise SpeechError(
-                    "MODEL_MISMATCH",
-                    f"Provider selected {actual_engine!r}, requested {requested.engine_id!r}",
-                )
-            if requested.model_id and actual_model and actual_model != requested.model_id:
-                raise SpeechError(
-                    "MODEL_MISMATCH",
-                    f"Provider selected model {actual_model!r}, requested {requested.model_id!r}",
-                )
-        return self.repository.save(profile, expected_revision)
+        async with self.leases.mutation():
+            previous = self.repository.assert_revision(expected_revision)
+            mutation_started = False
+            try:
+                for requested in (profile.stt, profile.tts):
+                    mutation_started = True
+                    actual = await self.models.select_model(requested)
+                    self._verify_selection(requested, actual)
+                validate = getattr(self.models, "validate_profile", None)
+                if validate:
+                    await validate(profile)
+                return self.repository.save(profile, expected_revision)
+            except Exception:
+                for selection in (previous.stt, previous.tts):
+                    if mutation_started:
+                        try:
+                            await self.models.select_model(selection)
+                        except Exception:
+                            pass
+                raise
 
     async def delete_voice(self, ref: VoiceRef) -> None:
-        await self.leases.assert_mutable(ref.encode())
-        await self.voices.delete_voice(ref)
+        async with self.leases.mutation():
+            await self.leases.assert_mutable(self.leases.voice_resource(ref))
+            await self.voices.delete_voice(ref)
 
     async def preview_voice(self, ref: VoiceRef, text: str, config):
         profile = RuntimeProfile(
@@ -62,3 +67,20 @@ class SpeechManagementService:
             async with self.leases.acquire(profile):
                 async for packet in self.voices.preview_voice(ref, text, config):
                     yield packet
+
+    @staticmethod
+    def _verify_selection(requested, actual) -> None:
+        actual_engine = actual.get("engine_id")
+        actual_model = actual.get("model_id")
+        if not actual_engine or actual_engine != requested.engine_id:
+            raise SpeechError(
+                "MODEL_MISMATCH",
+                f"Provider selected {actual_engine!r}, requested {requested.engine_id!r}",
+            )
+        if not actual.get("ready", True):
+            raise SpeechError("MODEL_NOT_READY", str(actual.get("missing") or "Model is not ready"))
+        if requested.model_id and actual_model != requested.model_id:
+            raise SpeechError(
+                "MODEL_MISMATCH",
+                f"Provider selected model {actual_model!r}, requested {requested.model_id!r}",
+            )

@@ -34,12 +34,13 @@ class VoiceStudioSTTAdapter:
         )
         payload = response.json()
         actual = payload.get("engine") or payload.get("model")
-        self._ensure_expected_engine(actual, config)
+        self._ensure_expected_engine(actual, config, payload.get("model"))
         return TranscriptionEvent(
             kind="final",
             final_kind="summary",
             text=str(payload.get("text", "")),
             actual_engine=actual,
+            actual_model=payload.get("model"),
         )
 
     async def stream_transcribe(
@@ -104,20 +105,24 @@ class VoiceStudioSTTAdapter:
             return None
         actual = payload.get("engine") or payload.get("actual_engine")
         actual_engine = str(actual) if actual else None
-        self._ensure_expected_engine(actual_engine, config)
+        actual_model_raw = payload.get("model") or payload.get("model_id")
+        actual_model = str(actual_model_raw) if actual_model_raw else None
+        self._ensure_expected_engine(actual_engine, config, actual_model)
         return TranscriptionEvent(
             kind="final",
             final_kind=final_kind,
             text=str(payload.get("text", "")),
             actual_engine=actual_engine,
+            actual_model=actual_model,
         )
 
     @staticmethod
-    def _ensure_expected_engine(actual: str | None, config: SpeechConfig) -> None:
-        if config.exact_model and actual and actual not in {
-            config.stt.engine_id,
-            config.stt.model_id,
-        }:
+    def _ensure_expected_engine(actual: str | None, config: SpeechConfig, actual_model: str | None = None) -> None:
+        if config.exact_model and (
+            not actual
+            or actual != config.stt.engine_id
+            or (config.stt.model_id is not None and actual_model != config.stt.model_id)
+        ):
             raise SpeechError(
                 "MODEL_MISMATCH",
                 f"Requested STT {config.stt.engine_id!r}, provider used {actual!r}",

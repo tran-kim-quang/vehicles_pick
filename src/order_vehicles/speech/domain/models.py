@@ -27,6 +27,7 @@ class TranscriptionEvent(ContractModel):
     text: str
     final_kind: Literal["utterance", "summary"] | None = None
     actual_engine: str | None = None
+    actual_model: str | None = None
 
 
 class ModelSelection(ContractModel):
@@ -37,7 +38,7 @@ class ModelSelection(ContractModel):
 
 class VoiceRef(ContractModel):
     provider_id: str
-    kind: Literal["clone", "design", "preset", "default"]
+    kind: Literal["clone", "design", "archetype", "preset", "default"]
     provider_voice_id: str
 
     def encode(self) -> str:
@@ -71,6 +72,8 @@ class EngineInfo(ContractModel):
     available: bool | None = None
     selected: bool | None = None
     capabilities: dict[str, bool | None] = Field(default_factory=dict)
+    active_model: str | None = None
+    env_override: bool = False
 
 
 class ModelInfo(ContractModel):
@@ -79,6 +82,7 @@ class ModelInfo(ContractModel):
     installation_state: Literal["available", "incomplete", "installed", "unknown"] = "unknown"
     loaded: bool | None = None
     engine_ids: tuple[str, ...] = ()
+    supported: bool | None = None
 
 
 class VoiceInfo(ContractModel):
@@ -128,7 +132,7 @@ class ManagementJob(ContractModel):
     id: UUID
     repo_id: str
     status: Literal[
-        "pending", "running", "cancel_requested", "completed", "failed", "unknown"
+        "pending", "running", "cancel_requested", "cancelled", "completed", "failed", "unknown"
     ]
     progress: float | None = None
     message: str | None = None

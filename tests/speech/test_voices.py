@@ -127,7 +127,7 @@ async def test_profiles_and_aliases_are_distinct(tmp_path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/profiles":
             return httpx.Response(200, json={"profiles": [{"id": "abcd1234", "name": "Nam", "kind": "clone"}]})
-        return httpx.Response(200, json={"voices": [{"id": "alloy", "name": "Alloy"}]})
+        return httpx.Response(200, json={"voices": [{"voice_id": "alloy", "name": "Alloy", "type": "openai_alias"}]})
 
     library, client = make_library(tmp_path, handler)
     voices = await library.list_voices(VoiceFilter())
@@ -140,10 +140,10 @@ async def test_profiles_and_aliases_are_distinct(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_pagination_collects_matching_archetypes(tmp_path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        page = int(request.url.params["page"])
-        if page == 1:
-            return httpx.Response(200, json={"items": [{"id": "one", "name": "Một", "language": "vi"}], "has_more": True})
-        return httpx.Response(200, json={"items": [{"id": "two", "name": "Hai", "language": "en"}], "has_more": False})
+        offset = int(request.url.params["offset"])
+        if offset == 0:
+            return httpx.Response(200, json={"items": [{"id": "one", "name": "Một", "language": "vi"}], "total": 2, "limit": 100, "offset": 0})
+        return httpx.Response(200, json={"items": [{"id": "two", "name": "Hai", "language": "en"}], "total": 2, "limit": 100, "offset": 1})
 
     library, client = make_library(tmp_path, handler)
     items = await library.list_archetypes(VoiceFilter(language="vi"))

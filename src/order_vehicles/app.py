@@ -40,8 +40,10 @@ def create_app(
     app.state.settings = settings
     app.state.services = services
     app.include_router(model_routes.router)
+    app.include_router(model_routes.contract_router)
     app.include_router(voice_routes.router)
     app.include_router(profile_routes.router)
+    app.include_router(profile_routes.contract_router)
 
     @app.exception_handler(SpeechError)
     async def speech_error_handler(request: Request, exc: SpeechError):
@@ -49,6 +51,7 @@ def create_app(
             "RESOURCE_IN_USE": 409,
             "REVISION_CONFLICT": 409,
             "UPSTREAM_CONFLICT": 409,
+            "MODEL_MISMATCH": 409,
             "UPSTREAM_FORBIDDEN": 403,
             "UPSTREAM_UNAUTHORIZED": 401,
             "UPSTREAM_UNAVAILABLE": 503,
@@ -78,7 +81,7 @@ def _services(settings: Settings, overrides: dict[str, object]):
 
     async def clone_capability(_: str):
         engines = await models.list_engines()
-        matching = [engine for engine in engines if engine.id == settings.default_tts_engine]
+        matching = [engine for engine in engines if engine.family == "tts" and engine.selected]
         return matching[0].capabilities.get("voice_clone") if matching else None
 
     voices = VoiceStudioVoiceLibrary(client, tts, clone_capability=clone_capability)

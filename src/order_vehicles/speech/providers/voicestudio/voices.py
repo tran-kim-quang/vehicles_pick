@@ -13,6 +13,7 @@ from order_vehicles.speech.domain.models import (
 )
 
 from .client import VoiceStudioClient
+from .presets import verified_presets
 
 
 class StreamingTTS:
@@ -31,22 +32,26 @@ class VoiceStudioVoiceLibrary:
         tts: StreamingTTS,
         *,
         clone_capability: Callable[[str], Awaitable[bool | None]],
+        archetype_page_size: int = 100,
     ) -> None:
         self.client = client
         self.tts = tts
         self.clone_capability = clone_capability
+        self.archetype_page_size = archetype_page_size
 
     async def list_voices(self, filter: VoiceFilter) -> list[VoiceInfo]:
         params = {k: v for k, v in filter.model_dump().items() if v is not None}
         profiles_response = await self.client.request("GET", "/profiles", params=params)
         profiles_payload = profiles_response.json()
-        profiles = profiles_payload.get("profiles", profiles_payload if isinstance(profiles_payload, list) else [])
+        profiles = profiles_payload if isinstance(profiles_payload, list) else profiles_payload.get("profiles", [])
         voices = [self._profile(item) for item in profiles]
 
         aliases_response = await self.client.request("GET", "/v1/audio/voices")
         aliases_payload = aliases_response.json()
         aliases = aliases_payload.get("voices", aliases_payload if isinstance(aliases_payload, list) else [])
         for item in aliases:
+            if item.get("type") != "openai_alias":
+                continue
             voice_id = str(item.get("id") or item.get("voice_id") or item.get("name"))
             voices.append(
                 VoiceInfo(
@@ -91,7 +96,7 @@ class VoiceStudioVoiceLibrary:
     async def update_voice(self, ref: VoiceRef, patch: dict[str, Any]) -> VoiceInfo:
         self._saved_profile(ref)
         response = await self.client.request(
-            "PATCH", f"/profiles/{ref.provider_voice_id}", json=patch
+            "PUT", f"/profiles/{ref.provider_voice_id}", json=patch
         )
         return self._profile(response.json(), default_kind=ref.kind)
 
@@ -105,11 +110,11 @@ class VoiceStudioVoiceLibrary:
             yield packet
 
     async def list_archetypes(self, filter: VoiceFilter) -> list[dict[str, Any]]:
-        page = 1
+        offset = 0
         result: list[dict[str, Any]] = []
         while True:
             response = await self.client.request(
-                "GET", "/archetypes", params={"page": page, "per_page": 100}
+                "GET", "/archetypes", params={"offset": offset, "limit": self.archetype_page_size}
             )
             payload = response.json()
             items = payload.get("items", [])
@@ -119,9 +124,15 @@ class VoiceStudioVoiceLibrary:
                 if (not filter.language or item.get("language") == filter.language)
                 and (not filter.query or filter.query.casefold() in str(item.get("name", "")).casefold())
             )
-            if not payload.get("has_more"):
+            offset += len(items)
+            if not items or offset >= int(payload.get("total", offset)):
                 return result
-            page += 1
+
+    def list_presets(self, engine_id: str) -> list[VoiceInfo]:
+        return [
+            VoiceInfo(reference=ref, name=ref.provider_voice_id)
+            for ref in verified_presets(engine_id)
+        ]
 
     async def use_archetype(self, id: str) -> VoiceInfo:
         response = await self.client.request("POST", f"/archetypes/{id}/use")

@@ -86,31 +86,76 @@ class ModelJobService:
         job = self._jobs[job_id]
         try:
             async with asyncio.timeout(self.tracking_timeout_seconds):
-                async for event in self.manager.watch_installation():
-                    if event.get("repo_id") not in {None, job.repo_id}:
-                        continue
-                    progress = event.get("progress")
-                    if progress is not None:
+                last_error: Exception | None = None
+                last_state = "unknown"
+                for attempt in range(3):
+                    terminal = None
+                    try:
+                        terminal = await self._watch_once(job_id, job.repo_id)
+                    except Exception as exc:
+                        last_error = exc
+                    if terminal == "install_cancelled":
                         current = self._jobs[job_id]
-                        self._jobs[job_id] = self._replace(
-                            current, progress=float(progress), message=event.get("message")
-                        )
-                    if event.get("status") in {"completed", "failed", "cancelled"}:
+                        self._jobs[job_id] = self._replace(current, status="cancelled", message="Cancelled")
+                        return
+                    try:
+                        last_state = await self._catalog_state(job.repo_id)
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt < 2:
+                            await asyncio.sleep(0)
+                            continue
                         break
-            await self._refresh_terminal(job_id)
+                    if last_state == "installed":
+                        current = self._jobs[job_id]
+                        self._jobs[job_id] = self._replace(current, status="completed", progress=1.0, message="Installed")
+                        return
+                    if terminal in {"install_error", "failed"}:
+                        break
+                    if attempt < 2:
+                        await asyncio.sleep(0)
+                current = self._jobs[job_id]
+                final_status = "failed" if last_state == "incomplete" else "unknown"
+                self._jobs[job_id] = self._replace(
+                    current,
+                    status=final_status,
+                    message=f"Installation status is {last_state}; reconciliation exhausted"
+                    + (f" ({type(last_error).__name__})" if last_error else ""),
+                )
         except TimeoutError:
             current = self._jobs[job_id]
             self._jobs[job_id] = self._replace(
                 current,
-                status="failed",
+                status="unknown",
                 message="Installation tracking timed out; upstream completion is unknown",
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            await self._refresh_terminal(job_id)
         finally:
             self._active_by_repo.pop(job.repo_id, None)
+
+    async def _watch_once(self, job_id: UUID, repo_id: str) -> str | None:
+        async for event in self.manager.watch_installation():
+            if event.get("repo_id") not in {None, repo_id}:
+                continue
+            progress = event.get("progress", event.get("pct"))
+            if progress is not None:
+                current = self._jobs[job_id]
+                self._jobs[job_id] = self._replace(
+                    current, progress=float(progress), message=event.get("message")
+                )
+            phase = event.get("phase")
+            status = event.get("status")
+            if status in {"completed", "failed", "cancelled"} or phase in {
+                "install_done", "install_error", "install_cancelled"
+            }:
+                return str(phase or status)
+        return None
+
+    async def _catalog_state(self, repo_id: str) -> str:
+        models = await self.manager.list_models()
+        model = next((item for item in models if item.repo_id == repo_id), None)
+        return model.installation_state if model else "unknown"
 
     async def _refresh_terminal(self, job_id: UUID) -> None:
         current = self._jobs[job_id]

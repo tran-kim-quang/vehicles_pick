@@ -82,6 +82,15 @@ class VoiceStudioTTSAdapter:
                     elif event_type == "start":
                         if payload.get("format") not in {"pcm16", "pcm_s16le"}:
                             raise SpeechError("TTS_PROTOCOL", "Unsupported TTS audio format")
+                        actual_engine = payload.get("engine")
+                        if config.exact_model and (
+                            not actual_engine or actual_engine != config.tts.engine_id
+                            or config.tts.model_id is not None
+                        ):
+                            raise SpeechError(
+                                "MODEL_MISMATCH",
+                                f"Requested TTS {config.tts.engine_id!r}, provider used {actual_engine!r}",
+                            )
                         audio_format = AudioFormat(
                             sample_rate=int(payload["sample_rate"]),
                             channels=int(payload.get("channels", 1)),

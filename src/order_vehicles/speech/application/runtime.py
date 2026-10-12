@@ -1,7 +1,7 @@
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from order_vehicles.speech.domain.errors import SpeechError
@@ -20,18 +20,33 @@ class SpeechRuntime:
     profile: RuntimeProfile
     recognizer: Any
     synthesizer: Any
+    _active_streams: set[Any] = field(default_factory=set)
 
     async def transcribe(self, frames) -> AsyncIterator[TranscriptionEvent]:
-        async for event in self.recognizer.stream_transcribe(
-            frames, self.profile.speech_config()
-        ):
-            yield event
+        stream = self.recognizer.stream_transcribe(frames, self.profile.speech_config())
+        self._active_streams.add(stream)
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await stream.aclose()
+            self._active_streams.discard(stream)
 
     async def speak(self, text: str) -> AsyncIterator[AudioPacket]:
-        async for packet in self.synthesizer.stream_synthesize(
-            text, self.profile.speech_config()
-        ):
-            yield packet
+        stream = self.synthesizer.stream_synthesize(text, self.profile.speech_config())
+        self._active_streams.add(stream)
+        try:
+            async for packet in stream:
+                yield packet
+        finally:
+            await stream.aclose()
+            self._active_streams.discard(stream)
+
+    async def aclose(self) -> None:
+        streams = list(self._active_streams)
+        for stream in streams:
+            await stream.aclose()
+        self._active_streams.clear()
 
 
 class SpeechRuntimeService:
@@ -68,4 +83,8 @@ class SpeechRuntimeService:
                 "UNKNOWN_PROVIDER", f"No speech provider registered for {provider_id!r}"
             ) from exc
         async with self.leases.acquire(snapshot):
-            yield SpeechRuntime(snapshot, recognizer, synthesizer)
+            runtime = SpeechRuntime(snapshot, recognizer, synthesizer)
+            try:
+                yield runtime
+            finally:
+                await runtime.aclose()

@@ -46,3 +46,12 @@ class JsonRuntimeProfileRepository:
                     pass
                 raise
             return saved
+
+    def assert_revision(self, expected_revision: int) -> RuntimeProfile:
+        current = self.get()
+        if current.revision != expected_revision:
+            raise SpeechError(
+                "REVISION_CONFLICT",
+                f"Expected profile revision {expected_revision}, found {current.revision}",
+            )
+        return current

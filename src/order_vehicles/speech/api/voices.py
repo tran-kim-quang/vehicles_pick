@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, File, Form, Request, Response, UploadFil
 from pydantic import BaseModel
 
 from order_vehicles.speech.domain.models import CloneRequest, VoiceFilter, VoiceRef
+from order_vehicles.speech.domain.errors import SpeechError
 
 from .dependencies import require_management_token, service
 
@@ -20,6 +21,10 @@ class VoicePatch(BaseModel):
     description: str | None = None
 
 
+class ArchetypeBody(BaseModel):
+    archetype_id: str
+
+
 @router.get("")
 async def list_voices(
     request: Request,
@@ -30,6 +35,20 @@ async def list_voices(
     return await service(request, "voices").list_voices(
         VoiceFilter(language=language, kind=kind, query=query)
     )
+
+
+@router.get("/archetypes")
+async def list_archetypes(
+    request: Request, language: str | None = None, query: str | None = None
+):
+    return await service(request, "voices").list_archetypes(
+        VoiceFilter(language=language, query=query)
+    )
+
+
+@router.get("/presets")
+async def list_presets(request: Request, engine_id: str):
+    return service(request, "voices").list_presets(engine_id)
 
 
 @router.post("/clone", status_code=201, dependencies=[Depends(require_management_token)])
@@ -57,16 +76,19 @@ async def use_archetype(archetype_id: str, request: Request):
     return await service(request, "voices").use_archetype(archetype_id)
 
 
-@router.post("/{encoded_ref}/preview")
+@router.post("/{encoded_ref}/preview", dependencies=[Depends(require_management_token)])
 async def preview_voice(encoded_ref: str, body: PreviewBody, request: Request):
     ref = VoiceRef.decode(encoded_ref)
     profile = service(request, "repository").get()
-    packets = [
-        packet
-        async for packet in service(request, "voices").preview_voice(
-            ref, body.text, profile.speech_config()
-        )
-    ]
+    packets = []
+    size = 0
+    async for packet in service(request, "management").preview_voice(
+        ref, body.text, profile.speech_config()
+    ):
+        size += len(packet.data)
+        if size > 64 * 1024 * 1024:
+            raise SpeechError("AUDIO_TOO_LARGE", "Preview exceeded the response size limit")
+        packets.append(packet)
     if not packets:
         return Response(status_code=503)
     stream = BytesIO()
@@ -81,6 +103,11 @@ async def preview_voice(encoded_ref: str, body: PreviewBody, request: Request):
         media_type="audio/wav",
         headers={"X-Sample-Rate": str(audio_format.sample_rate)},
     )
+
+
+@router.post("/from-archetype", dependencies=[Depends(require_management_token)])
+async def from_archetype(body: ArchetypeBody, request: Request):
+    return await service(request, "voices").use_archetype(body.archetype_id)
 
 
 @router.patch("/{encoded_ref}", dependencies=[Depends(require_management_token)])
