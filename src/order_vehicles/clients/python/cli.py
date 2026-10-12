@@ -1,11 +1,16 @@
+import asyncio
 import json
 from pathlib import Path
+from typing import Annotated
 
 import typer
 
 from order_vehicles.settings import Settings
 
 from .management import ManagementClient
+from .microphone import PythonMicClient
+from .recording import record_reference
+from .results import AtomicBookingWriter
 
 app = typer.Typer(help="Voice booking and speech management CLI")
 models_app = typer.Typer(help="Manage VoiceStudio models")
@@ -29,6 +34,37 @@ def server() -> None:
     import uvicorn
     settings = Settings()
     uvicorn.run("order_vehicles.app:app", host=settings.host, port=settings.port)
+
+
+@app.command()
+def devices() -> None:
+    """List host audio devices."""
+    try:
+        import sounddevice
+    except ImportError as exc:
+        raise typer.BadParameter(
+            "Audio support requires: uv sync --extra audio"
+        ) from exc
+    values = [dict(item) for item in sounddevice.query_devices()]
+    typer.echo(json.dumps(values, ensure_ascii=False, indent=2, default=str))
+
+
+@app.command()
+def mic(
+    url: str = "ws://127.0.0.1:8000/v1/voice/sessions",
+    input_device: int | None = None,
+    output_device: int | None = None,
+    push_to_talk: bool = False,
+) -> None:
+    """Run the microphone booking client."""
+    settings = Settings()
+    client = PythonMicClient(writer=AtomicBookingWriter(settings.output_dir))
+    try:
+        asyncio.run(
+            client.run(url, input_device, output_device, push_to_talk)
+        )
+    except KeyboardInterrupt:
+        typer.echo("Đã dừng.")
 
 
 @models_app.command("list")
@@ -82,6 +118,30 @@ def voices_clone(audio: Path, name: str, ref_text: str = "", language: str = "vi
     try:
         with audio.open("rb") as source:
             result = client.post("/v1/speech/voices/clone", data={"name": name, "ref_text": ref_text, "language": language}, files={"ref_audio": (audio.name, source)})
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    finally:
+        client.close()
+
+
+@voices_app.command("record")
+def voices_record(
+    name: Annotated[str, typer.Option("--name")],
+    seconds: Annotated[float, typer.Option("--seconds")] = 8.0,
+    device: int | None = None,
+    ref_text: str = "",
+    language: str = "vi",
+    url: str = "http://127.0.0.1:8000",
+    token: str = "",
+) -> None:
+    """Record a standalone reference WAV and create a voice clone."""
+    wav = asyncio.run(record_reference(seconds, device))
+    client = _client(url, token)
+    try:
+        result = client.post(
+            "/v1/speech/voices/clone",
+            data={"name": name, "ref_text": ref_text, "language": language},
+            files={"ref_audio": ("reference.wav", wav, "audio/wav")},
+        )
         typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
     finally:
         client.close()
