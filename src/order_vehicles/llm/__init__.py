@@ -1,0 +1,1 @@
+"""Configurable LLM boundary."""

@@ -1,0 +1,304 @@
+import asyncio
+import sys
+import time
+from collections.abc import AsyncIterator
+from contextlib import suppress
+from uuid import uuid4
+
+from order_vehicles.speech.domain.models import AudioFormat, AudioPacket
+from order_vehicles.observability.timing import TurnTiming
+
+from .audio import AudioInputOverflow, SoundDeviceInput
+from .playback import SoundDeviceOutput
+from .results import AtomicBookingWriter, ResultConflict, ResultWriteError
+from .transport import PythonSessionTransport
+from .turns import TurnController
+from .vad import EnergyVAD
+
+
+class PythonMicClient:
+    def __init__(
+        self,
+        *,
+        input_source=None,
+        output=None,
+        transport=None,
+        writer: AtomicBookingWriter,
+        turn_controller=None,
+        push_to_talk_commands=None,
+        timing_recorder=None,
+        monotonic=time.perf_counter,
+        echo=print,
+    ) -> None:
+        self.input_source = input_source or SoundDeviceInput()
+        self.output = output or SoundDeviceOutput()
+        self.transport = transport or PythonSessionTransport()
+        self.writer = writer
+        self.turn_controller = turn_controller or TurnController(EnergyVAD())
+        self.push_to_talk_commands = push_to_talk_commands
+        self.timing_recorder = timing_recorder
+        self.monotonic = monotonic
+        self._client_timings: dict[str, TurnTiming] = {}
+        self._session_id: str | None = None
+        self._session_ready = asyncio.Event()
+        if hasattr(self.output, "on_first_audio"):
+            self.output.on_first_audio = self._mark_playback_started
+        self.echo = echo
+
+    async def run(
+        self,
+        url: str,
+        input_device: int | None,
+        output_device: int | None,
+        push_to_talk: bool,
+    ) -> None:
+        await self.input_source.open(input_device)
+        socket = None
+        tasks: list[asyncio.Task] = []
+        done = asyncio.Event()
+        state = {
+            "response_id": None,
+            "output_format": None,
+            "confirmed": False,
+            "confirmed_response": None,
+            "pending_payload": None,
+        }
+        try:
+            async with self.transport.connect(url) as socket:
+                await socket.send_json(
+                    {
+                        "type": "session.start",
+                        "version": "voice.booking.v1",
+                        "audio_format": {
+                            "encoding": "pcm_s16le",
+                            "sample_rate": 16000,
+                            "channels": 1,
+                        },
+                    }
+                )
+                tasks = [
+                    asyncio.create_task(
+                        self._receive(socket, output_device, state, done)
+                    ),
+                    asyncio.create_task(self._capture(socket, push_to_talk)),
+                    asyncio.create_task(self._playback_ack(socket, state, done)),
+                    asyncio.create_task(done.wait()),
+                ]
+                finished, _ = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in finished:
+                    if task is not tasks[-1]:
+                        task.result()
+                if done.is_set():
+                    await socket.close()
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await self.input_source.close()
+            await self.output.close()
+            if socket is not None and not getattr(socket, "closed", False):
+                with suppress(Exception):
+                    await socket.close()
+
+    async def _capture(self, socket, push_to_talk: bool) -> None:
+        await self._session_ready.wait()
+        if push_to_talk:
+            await self._capture_push_to_talk(socket)
+            return
+        turn_id: str | None = None
+        while True:
+            try:
+                async for frame in self.input_source.frames():
+                    for event in self.turn_controller.feed(frame):
+                        if event.kind == "start":
+                            self.output.clear()
+                            await self._send_event(socket, {"type": "response.interrupt"})
+                            turn_id = str(uuid4())
+                            await self._send_event(
+                                socket,
+                                {"type": "input_audio.start", "turn_id": turn_id}
+                            )
+                        elif event.kind == "frame" and event.pcm is not None:
+                            await socket.send_bytes(event.pcm)
+                        elif event.kind == "end" and turn_id:
+                            await self._send_event(
+                                socket,
+                                {"type": "input_audio.end", "turn_id": turn_id}
+                            )
+                            turn_id = None
+                return
+            except AudioInputOverflow:
+                self.turn_controller.overflow()
+                if turn_id:
+                    await self._send_event(
+                        socket,
+                        {
+                            "type": "input_audio.abort",
+                            "turn_id": turn_id,
+                            "reason": "overflow",
+                        },
+                    )
+                    turn_id = None
+                self.echo("Audio đầu vào bị tràn; vui lòng nói lại.")
+
+    async def _capture_push_to_talk(self, socket) -> None:
+        frames = self.input_source.frames().__aiter__()
+        commands = (
+            self.push_to_talk_commands
+            if self.push_to_talk_commands is not None
+            else self._terminal_push_to_talk_commands()
+        ).__aiter__()
+        frame_task = asyncio.create_task(anext(frames))
+        command_task = asyncio.create_task(anext(commands))
+        turn_id: str | None = None
+        try:
+            while True:
+                finished, _ = await asyncio.wait(
+                    {frame_task, command_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if command_task in finished:
+                    command = command_task.result()
+                    command_task = asyncio.create_task(anext(commands))
+                    if command == "start" and turn_id is None:
+                        self.output.clear()
+                        await self._send_event(socket, {"type": "response.interrupt"})
+                        turn_id = str(uuid4())
+                        await self._send_event(
+                            socket,
+                            {"type": "input_audio.start", "turn_id": turn_id}
+                        )
+                    elif command == "end" and turn_id is not None:
+                        await self._send_event(
+                            socket,
+                            {"type": "input_audio.end", "turn_id": turn_id}
+                        )
+                        turn_id = None
+                if frame_task in finished:
+                    frame = frame_task.result()
+                    frame_task = asyncio.create_task(anext(frames))
+                    if turn_id is not None:
+                        await socket.send_bytes(frame)
+        finally:
+            for task in (frame_task, command_task):
+                task.cancel()
+            await asyncio.gather(frame_task, command_task, return_exceptions=True)
+
+    async def _terminal_push_to_talk_commands(self) -> AsyncIterator[str]:
+        active = False
+        while True:
+            action = "kết thúc" if active else "bắt đầu"
+            self.echo(f"Nhấn Enter để {action} lượt nói.")
+            await self._read_terminal_line()
+            active = not active
+            yield "start" if active else "end"
+
+    @staticmethod
+    async def _read_terminal_line() -> None:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        def ready() -> None:
+            sys.stdin.readline()
+            if not future.done():
+                future.set_result(None)
+
+        try:
+            loop.add_reader(sys.stdin.fileno(), ready)
+        except (AttributeError, NotImplementedError):
+            await asyncio.to_thread(sys.stdin.readline)
+            return
+        try:
+            await future
+        finally:
+            loop.remove_reader(sys.stdin.fileno())
+
+    async def _receive(self, socket, output_device, state, done) -> None:
+        while not done.is_set():
+            event = await socket.receive()
+            if isinstance(event, bytes):
+                response_id = state["response_id"]
+                audio_format = state["output_format"]
+                if response_id and audio_format:
+                    packet = AudioPacket(format=audio_format, data=event)
+                    if hasattr(self.output, "enqueue_async"):
+                        await self.output.enqueue_async(response_id, packet)
+                    else:
+                        self.output.enqueue(response_id, packet)
+                continue
+            event_type = event.get("type")
+            if event_type == "session.started":
+                self._session_id = event["session_id"]
+                self._session_ready.set()
+            elif event_type in {"transcript.partial", "transcript.final"}:
+                self.echo(event.get("text", ""))
+            elif event_type == "assistant.audio.start":
+                audio_format = AudioFormat.model_validate(event["format"])
+                if state["output_format"] is None:
+                    await self.output.open(audio_format, output_device)
+                elif state["output_format"] != audio_format:
+                    raise RuntimeError("TTS audio format changed within the session")
+                state["output_format"] = audio_format
+                state["response_id"] = event["response_id"]
+                timing = TurnTiming(clock_domain="client")
+                timing.mark("audio.received", self.monotonic())
+                self._client_timings[event["response_id"]] = timing
+            elif event_type == "assistant.audio.end":
+                response_id = event["response_id"]
+                if hasattr(self.output, "end_response_async"):
+                    await self.output.end_response_async(response_id)
+                else:
+                    self.output.end_response(response_id)
+                if not state["confirmed"] and state["pending_payload"]:
+                    state["confirmed"] = self._persist_result(
+                        state["pending_payload"]
+                    )
+                if state["confirmed"]:
+                    state["confirmed_response"] = response_id
+            elif event_type == "assistant.response.interrupted":
+                self.output.clear()
+                state["response_id"] = None
+            elif event_type == "booking.confirmed":
+                state["pending_payload"] = event["payload"]
+                state["confirmed"] = self._persist_result(event["payload"])
+            elif event_type == "error":
+                self.echo(f"Lỗi {event.get('code')}: {event.get('message')}")
+
+    def _persist_result(self, payload: dict) -> bool:
+        try:
+            path = self.writer.write(payload)
+        except (ResultWriteError, ResultConflict, ValueError) as exc:
+            self.echo(f"Lỗi lưu kết quả: {exc}")
+            return False
+        self.echo(f"Đã lưu kết quả: {path}")
+        return True
+
+    def _mark_playback_started(self, response_id: str, at: float) -> None:
+        timing = self._client_timings.pop(response_id, None)
+        if timing is None:
+            return
+        timing.mark("playback.first_audio", at)
+        if self.timing_recorder:
+            self.timing_recorder.record(timing, {})
+
+    async def _playback_ack(self, socket, state, done) -> None:
+        async for response_id in self.output.finished():
+            await self._send_event(
+                socket,
+                {
+                    "type": "assistant.playback.finished",
+                    "response_id": response_id,
+                }
+            )
+            if response_id == state["confirmed_response"]:
+                done.set()
+                return
+
+    async def _send_event(self, socket, event: dict) -> None:
+        if self._session_id:
+            event = {**event, "session_id": self._session_id}
+        await socket.send_json(event)

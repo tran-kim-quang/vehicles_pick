@@ -1,0 +1,1 @@
+"""VoiceStudio provider adapter."""
