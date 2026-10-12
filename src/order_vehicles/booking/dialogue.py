@@ -1,0 +1,103 @@
+from datetime import datetime
+from typing import Literal
+from uuid import uuid4
+
+from pydantic import BaseModel
+
+from .confirmation import confirmation_text
+from .fields import FieldRegistry
+from .models import CallSession, CallStatus, ExtractionResult
+from .serializer import BookingSerializer
+
+
+class DialogueDecision(BaseModel):
+    kind: Literal["ask", "confirm", "complete", "cancel", "assist"]
+    text: str
+    field: str | None = None
+    payload: dict | None = None
+
+
+QUESTIONS = {
+    "name": "Bạn tên là gì?",
+    "phone": "Số điện thoại của bạn là gì?",
+    "booking_mode": "Bạn muốn đi ngay hay đặt trước?",
+    "scheduled_at": "Bạn muốn đặt xe lúc mấy giờ, ngày nào?",
+    "vehicle_type": "Bạn muốn đi bike hay car?",
+}
+
+
+class DialogueManager:
+    def __init__(self, fields: FieldRegistry, serializer: BookingSerializer | None = None) -> None:
+        self.fields = fields
+        self.serializer = serializer or BookingSerializer(fields.timezone_name)
+
+    def handle(self, session: CallSession, result: ExtractionResult, now: datetime) -> DialogueDecision:
+        before = session.revision
+        errors = self.fields.apply(session, result.patch, now)
+        changed = session.revision != before
+        if changed:
+            self.invalidate_confirmation(session)
+        if result.intent == "cancel":
+            session.status = CallStatus.CANCELLED
+            return DialogueDecision(kind="cancel", text="Đã hủy yêu cầu.")
+        if not session.vehicles_snapshot:
+            session.status = CallStatus.NEEDS_ASSISTANCE
+            return DialogueDecision(kind="assist", text="Hiện chưa có loại xe khả dụng.")
+
+        missing = self.fields.missing_fields(session)
+        if missing:
+            field = missing[0]
+            if not changed and result.intent not in {"provide", "correct"}:
+                session.attempts_by_field[field] = session.attempts_by_field.get(field, 0) + 1
+            elif field not in errors:
+                session.attempts_by_field[field] = 0
+            session.last_asked_field = field
+            if session.attempts_by_field.get(field, 0) >= 3:
+                session.status = CallStatus.NEEDS_ASSISTANCE
+                return DialogueDecision(kind="assist", text="Tôi sẽ chuyển bạn sang hỗ trợ viên.")
+            session.status = CallStatus.COLLECTING
+            return DialogueDecision(kind="ask", field=field, text=QUESTIONS[field])
+
+        if result.intent == "affirm" and not changed:
+            if (
+                session.status == CallStatus.AWAITING_CONFIRMATION
+                and session.playback_finished
+                and session.pending_confirmation_revision == session.revision
+            ):
+                if not self._revalidate_schedule(session, now):
+                    return DialogueDecision(kind="ask", field="scheduled_at", text=QUESTIONS["scheduled_at"])
+                session.confirmed_revision = session.revision
+                session.status = CallStatus.COMPLETED
+                payload = self.serializer.serialize(session, now)
+                return DialogueDecision(kind="complete", text="Thông tin đã được xác nhận.", payload=payload)
+            return DialogueDecision(kind="ask", text="Vui lòng xác nhận sau khi nghe hết thông tin.")
+
+        session.status = CallStatus.AWAITING_CONFIRMATION
+        session.pending_confirmation_revision = session.revision
+        session.confirmation_response_id = str(uuid4())
+        session.playback_finished = False
+        return DialogueDecision(kind="confirm", text=confirmation_text(session))
+
+    def mark_playback_finished(self, session: CallSession, response_id: str | None) -> None:
+        if response_id and response_id == session.confirmation_response_id:
+            session.playback_finished = True
+
+    @staticmethod
+    def invalidate_confirmation(session: CallSession) -> None:
+        session.pending_confirmation_revision = None
+        session.confirmation_response_id = None
+        session.playback_finished = False
+        if session.status == CallStatus.AWAITING_CONFIRMATION:
+            session.status = CallStatus.COLLECTING
+
+    def _revalidate_schedule(self, session: CallSession, now: datetime) -> bool:
+        if session.fields["booking_mode"].value != "scheduled":
+            return True
+        scheduled = session.fields.get("scheduled_at")
+        if scheduled and scheduled.valid and scheduled.value > now:
+            return True
+        if scheduled:
+            scheduled.valid = False
+            session.revision += 1
+        self.invalidate_confirmation(session)
+        return False
