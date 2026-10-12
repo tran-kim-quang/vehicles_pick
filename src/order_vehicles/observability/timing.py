@@ -57,14 +57,17 @@ class TimingRecorder:
         with self._lock:
             self._records.append((timing.clock_domain, timing.metrics(), safe))
 
-    def summary(self) -> dict[str, dict[str, dict[str, float | int]]]:
+    def summary(self) -> dict:
         grouped: dict[str, dict[str, list[float]]] = {}
+        metadata_by_domain: dict[str, list[dict]] = {}
         with self._lock:
             records = list(self._records)
-        for domain, metrics, _ in records:
+        for domain, metrics, metadata in records:
             for name, value in metrics.items():
                 grouped.setdefault(domain, {}).setdefault(name, []).append(value)
-        return {
+            if metadata and metadata not in metadata_by_domain.setdefault(domain, []):
+                metadata_by_domain[domain].append(metadata)
+        result = {
             domain: {
                 name: {
                     "count": len(values),
@@ -75,6 +78,9 @@ class TimingRecorder:
             }
             for domain, metrics in grouped.items()
         }
+        for domain, metadata in metadata_by_domain.items():
+            result.setdefault(domain, {})["metadata"] = metadata
+        return result
 
     @staticmethod
     def _percentile(values: list[float], percentile: float) -> float:

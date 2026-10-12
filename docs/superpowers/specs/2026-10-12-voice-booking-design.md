@@ -77,7 +77,7 @@ Endpoint của project: `WS /v1/voice/sessions`. Đây là API dự kiến xây 
 3. Audio đầu vào trên một socket chỉ thuộc một lượt đang mở. Bản MVP không có nhiều lượt input chồng nhau trên cùng socket.
 4. Backend trả `transcript.partial`, `transcript.final`, `assistant.text`, `assistant.audio.start`, các frame audio rồi `assistant.audio.end`.
 5. Client gửi `assistant.playback.finished` khi đã phát hết buffer. Kết thúc truyền audio không đồng nghĩa kết thúc phát trên thiết bị.
-6. Client gửi `response.interrupt` khi bắt đầu nói trong lúc assistant đang phát; dừng/xóa playback ngay tại client, không chờ backend xác nhận.
+6. Client gửi `response.interrupt` khi bắt đầu nói trong lúc assistant đang phát; dừng/xóa playback ngay tại client, không chờ backend xác nhận. Nếu buffer micro overflow, client gửi `input_audio.abort` để backend hủy toàn bộ lượt thay vì chốt phần audio thiếu.
 7. Kết quả cuối là `booking.confirmed` chứa JSON; các trạng thái khác qua `session.state`, lỗi qua `error`, đóng phiên qua `session.end`.
 
 Mọi sự kiện sau handshake có `session_id`. Sự kiện theo lượt có `turn_id`; câu trả lời có `response_id`. Backend và client giữ response đang hiệu lực. Frame audio đi theo metadata response vừa mở, không trộn hai response. Khi ngắt, kết quả cũ bị bỏ; audio đã xếp hàng của response cũ phải được drain hoặc đóng socket trước khi mở luồng mới để không gán nhầm bytes cho response mới.

@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 from order_vehicles.clients.python.cli import app
 from order_vehicles.clients.python.microphone import PythonMicClient
 from order_vehicles.clients.python.results import AtomicBookingWriter
+from order_vehicles.clients.python.audio import AudioInputOverflow
 from order_vehicles.clients.python.turns import TurnController
 
 from .test_results import payload
@@ -159,9 +160,15 @@ async def test_write_failure_does_not_print_success(tmp_path, monkeypatch) -> No
         transport=FakeTransport(FakeSocket(incoming_events())), writer=writer,
         turn_controller=TurnController(MarkerVAD()), echo=messages.append,
     )
-    await asyncio.wait_for(client.run("ws://test", None, None, False), 1)
+    task = asyncio.create_task(client.run("ws://test", None, None, False))
+    while not writer.pending:
+        await asyncio.sleep(0)
     assert "đã lưu" not in " ".join(messages).lower()
     assert writer.pending
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio
@@ -190,3 +197,43 @@ def test_microphone_and_record_commands_expose_device_flags() -> None:
     assert "--push-to-talk" in mic_help.output
     assert record_help.exit_code == 0
     assert "--name" in record_help.output and "--seconds" in record_help.output
+
+
+@pytest.mark.asyncio
+async def test_microphone_overflow_aborts_turn_and_keeps_session_open(tmp_path) -> None:
+    class OverflowInput(FakeInput):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def frames(self):
+            self.calls += 1
+            if self.calls == 1:
+                for _ in range(10):
+                    yield b"speech"
+                raise AudioInputOverflow("overflow")
+            while True:
+                await asyncio.sleep(3600)
+
+    source = OverflowInput()
+    socket = FakeSocket(
+        [{"type": "session.started", "session_id": "s", "request_id": "r"}]
+    )
+    client = PythonMicClient(
+        input_source=source,
+        output=FakeOutput(),
+        transport=FakeTransport(socket),
+        writer=AtomicBookingWriter(tmp_path),
+        turn_controller=TurnController(MarkerVAD()),
+        echo=lambda _: None,
+    )
+    task = asyncio.create_task(client.run("ws://test", None, None, False))
+    while not any(
+        isinstance(item, dict) and item.get("type") == "input_audio.abort"
+        for item in socket.sent
+    ):
+        await asyncio.sleep(0)
+    assert not task.done() and source.calls >= 2
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

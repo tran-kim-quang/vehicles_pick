@@ -92,7 +92,7 @@ uv run pytest tests/integration/test_live_voice.py -q -s
 
 Lặp ba phiên liên tiếp; trong ít nhất một phiên hãy nói khi assistant đang phát để kiểm tra audio cũ dừng ngay. Đạt khi nghe được audio tiếng Việt, response cũ không phát tiếp, không có JSON trước xác nhận, và mỗi phiên tạo đúng một JSON hợp lệ.
 
-Server và client đo bằng đồng hồ monotonic riêng. Endpoint sau chỉ tổng hợp duration trong cùng process, không trừ timestamp tuyệt đối giữa hai máy:
+Server và client đo bằng đồng hồ monotonic riêng. `ov mic` in timing phía client khi phiên kết thúc; endpoint sau chỉ tổng hợp timing phía server. Cả hai chỉ tính duration trong cùng process, không trừ timestamp tuyệt đối giữa hai máy:
 
 ```bash
 curl http://127.0.0.1:8000/v1/voice/timings

@@ -32,6 +32,16 @@ class DialogueManager:
         self.serializer = serializer or BookingSerializer(fields.timezone_name)
 
     def handle(self, session: CallSession, result: ExtractionResult, now: datetime) -> DialogueDecision:
+        if session.status == CallStatus.COMPLETED:
+            return DialogueDecision(
+                kind="complete",
+                text="Thông tin đã được xác nhận.",
+                payload=session.final_payload,
+            )
+        if session.status == CallStatus.CANCELLED:
+            return DialogueDecision(kind="cancel", text="Yêu cầu đã được hủy.")
+        if session.status == CallStatus.NEEDS_ASSISTANCE:
+            return DialogueDecision(kind="assist", text="Phiên đang chờ hỗ trợ viên.")
         before = session.revision
         errors = self.fields.apply(session, result.patch, now)
         changed = session.revision != before
@@ -47,10 +57,11 @@ class DialogueManager:
         missing = self.fields.missing_fields(session)
         if missing:
             field = missing[0]
-            if not changed and result.intent not in {"provide", "correct"}:
+            for resolved in session.attempts_by_field.keys() & session.fields.keys():
+                if session.fields[resolved].valid:
+                    session.attempts_by_field[resolved] = 0
+            if field in errors or (not changed and result.intent != "cancel"):
                 session.attempts_by_field[field] = session.attempts_by_field.get(field, 0) + 1
-            elif field not in errors:
-                session.attempts_by_field[field] = 0
             session.last_asked_field = field
             if session.attempts_by_field.get(field, 0) >= 3:
                 session.status = CallStatus.NEEDS_ASSISTANCE
@@ -69,6 +80,7 @@ class DialogueManager:
                 session.confirmed_revision = session.revision
                 session.status = CallStatus.COMPLETED
                 payload = self.serializer.serialize(session, now)
+                session.final_payload = payload
                 return DialogueDecision(kind="complete", text="Thông tin đã được xác nhận.", payload=payload)
             return DialogueDecision(kind="ask", text="Vui lòng xác nhận sau khi nghe hết thông tin.")
 

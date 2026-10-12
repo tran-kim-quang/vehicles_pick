@@ -79,3 +79,18 @@ async def test_ack_after_device_playback_not_network_done() -> None:
     output.render(1)
     assert await pending == "r1"
     await output.close()
+
+
+@pytest.mark.asyncio
+async def test_async_enqueue_waits_for_playback_capacity() -> None:
+    output = SoundDeviceOutput(device_module=FakeOutputDevice(), max_seconds=0.00005)
+    format = AudioFormat(sample_rate=48000)
+    await output.open(format, None)
+    packet = AudioPacket(format=format, data=b"\x01\x00" * 2)
+    output.enqueue("r1", packet)
+    waiting = asyncio.create_task(output.enqueue_async("r1", packet))
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    output.render(2)
+    await waiting
+    await output.close()

@@ -61,6 +61,7 @@ class PythonMicClient:
             "output_format": None,
             "confirmed": False,
             "confirmed_response": None,
+            "pending_payload": None,
         }
         try:
             async with self.transport.connect(url) as socket:
@@ -109,33 +110,40 @@ class PythonMicClient:
             await self._capture_push_to_talk(socket)
             return
         turn_id: str | None = None
-        try:
-            async for frame in self.input_source.frames():
-                for event in self.turn_controller.feed(frame):
-                    if event.kind == "start":
-                        self.output.clear()
-                        await self._send_event(socket, {"type": "response.interrupt"})
-                        turn_id = str(uuid4())
-                        await self._send_event(
-                            socket,
-                            {"type": "input_audio.start", "turn_id": turn_id}
-                        )
-                    elif event.kind == "frame" and event.pcm is not None:
-                        await socket.send_bytes(event.pcm)
-                    elif event.kind == "end" and turn_id:
-                        await self._send_event(
-                            socket,
-                            {"type": "input_audio.end", "turn_id": turn_id}
-                        )
-                        turn_id = None
-        except AudioInputOverflow:
-            self.turn_controller.overflow()
-            if turn_id:
-                await self._send_event(
-                    socket,
-                    {"type": "input_audio.end", "turn_id": turn_id}
-                )
-            self.echo("Audio đầu vào bị tràn; vui lòng nói lại.")
+        while True:
+            try:
+                async for frame in self.input_source.frames():
+                    for event in self.turn_controller.feed(frame):
+                        if event.kind == "start":
+                            self.output.clear()
+                            await self._send_event(socket, {"type": "response.interrupt"})
+                            turn_id = str(uuid4())
+                            await self._send_event(
+                                socket,
+                                {"type": "input_audio.start", "turn_id": turn_id}
+                            )
+                        elif event.kind == "frame" and event.pcm is not None:
+                            await socket.send_bytes(event.pcm)
+                        elif event.kind == "end" and turn_id:
+                            await self._send_event(
+                                socket,
+                                {"type": "input_audio.end", "turn_id": turn_id}
+                            )
+                            turn_id = None
+                return
+            except AudioInputOverflow:
+                self.turn_controller.overflow()
+                if turn_id:
+                    await self._send_event(
+                        socket,
+                        {
+                            "type": "input_audio.abort",
+                            "turn_id": turn_id,
+                            "reason": "overflow",
+                        },
+                    )
+                    turn_id = None
+                self.echo("Audio đầu vào bị tràn; vui lòng nói lại.")
 
     async def _capture_push_to_talk(self, socket) -> None:
         frames = self.input_source.frames().__aiter__()
@@ -216,10 +224,11 @@ class PythonMicClient:
                 response_id = state["response_id"]
                 audio_format = state["output_format"]
                 if response_id and audio_format:
-                    self.output.enqueue(
-                        response_id,
-                        AudioPacket(format=audio_format, data=event),
-                    )
+                    packet = AudioPacket(format=audio_format, data=event)
+                    if hasattr(self.output, "enqueue_async"):
+                        await self.output.enqueue_async(response_id, packet)
+                    else:
+                        self.output.enqueue(response_id, packet)
                 continue
             event_type = event.get("type")
             if event_type == "session.started":
@@ -240,22 +249,33 @@ class PythonMicClient:
                 self._client_timings[event["response_id"]] = timing
             elif event_type == "assistant.audio.end":
                 response_id = event["response_id"]
-                self.output.end_response(response_id)
+                if hasattr(self.output, "end_response_async"):
+                    await self.output.end_response_async(response_id)
+                else:
+                    self.output.end_response(response_id)
+                if not state["confirmed"] and state["pending_payload"]:
+                    state["confirmed"] = self._persist_result(
+                        state["pending_payload"]
+                    )
                 if state["confirmed"]:
                     state["confirmed_response"] = response_id
             elif event_type == "assistant.response.interrupted":
                 self.output.clear()
                 state["response_id"] = None
             elif event_type == "booking.confirmed":
-                state["confirmed"] = True
-                try:
-                    path = self.writer.write(event["payload"])
-                except (ResultWriteError, ResultConflict, ValueError) as exc:
-                    self.echo(f"Lỗi lưu kết quả: {exc}")
-                else:
-                    self.echo(f"Đã lưu kết quả: {path}")
+                state["pending_payload"] = event["payload"]
+                state["confirmed"] = self._persist_result(event["payload"])
             elif event_type == "error":
                 self.echo(f"Lỗi {event.get('code')}: {event.get('message')}")
+
+    def _persist_result(self, payload: dict) -> bool:
+        try:
+            path = self.writer.write(payload)
+        except (ResultWriteError, ResultConflict, ValueError) as exc:
+            self.echo(f"Lỗi lưu kết quả: {exc}")
+            return False
+        self.echo(f"Đã lưu kết quả: {path}")
+        return True
 
     def _mark_playback_started(self, response_id: str, at: float) -> None:
         timing = self._client_timings.pop(response_id, None)

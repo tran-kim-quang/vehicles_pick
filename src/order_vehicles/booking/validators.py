@@ -37,7 +37,7 @@ def resolve_schedule(proposal: ScheduleProposal, now: datetime, timezone_name: s
         hour = 0 if hour == 12 else hour
     elif proposal.period == "pm":
         hour = 12 if hour == 12 else hour + 12
-    elif proposal.period != "24h" and hour <= 12:
+    elif proposal.period != "24h" and 1 <= hour <= 12:
         raise ValueError("ambiguous hour")
     scheduled = datetime.combine(day, time(hour, proposal.minute), zone)
     if scheduled <= local_now:

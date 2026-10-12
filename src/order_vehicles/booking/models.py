@@ -61,6 +61,7 @@ class CallSession(DomainModel):
     attempts_by_field: dict[str, int] = Field(default_factory=dict)
     last_asked_field: str | None = None
     final_emitted: bool = False
+    final_payload: dict | None = None
     detached_at: datetime | None = None
     resume_token: str | None = None
 

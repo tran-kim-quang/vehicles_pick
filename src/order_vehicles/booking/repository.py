@@ -21,13 +21,16 @@ class SessionRepository:
             self._sessions[session.session_id] = session.model_copy(deep=True)
             return session
 
-    def get(self, session_id: UUID | str) -> CallSession:
+    def get(self, session_id: UUID | str, now: datetime | None = None) -> CallSession:
         session_id = UUID(str(session_id))
         with self._lock:
             try:
                 session = self._sessions[session_id].model_copy(deep=True)
             except KeyError as exc:
                 raise SpeechError("SESSION_NOT_FOUND", "Session not found") from exc
+            if now and session.detached_at and now - session.detached_at > self.ttl:
+                del self._sessions[session_id]
+                raise SpeechError("SESSION_EXPIRED", "Session resume window expired")
             if session.detached_at:
                 session.pending_confirmation_revision = None
                 session.confirmation_response_id = None

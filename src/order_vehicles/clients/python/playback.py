@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable
@@ -40,6 +41,9 @@ class SoundDeviceOutput:
         self.finished_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.pending_ack: str | None = None
+        self.space_available = asyncio.Event()
+        self.space_available.set()
+        self.lock = threading.RLock()
         self.on_first_audio = on_first_audio
         self.monotonic = monotonic
         self.played_responses: set[str] = set()
@@ -94,26 +98,71 @@ class SoundDeviceOutput:
         data = packet.data
         if self.resampler is not None:
             data = self.resampler.process(data, final=False)
-        if self.queued_bytes + len(data) > self.max_bytes:
+        self._enqueue_data(response_id, data)
+
+    async def enqueue_async(self, response_id: str, packet: AudioPacket) -> None:
+        if self.source_format is None:
+            raise RuntimeError("Output device is not open")
+        if packet.format != self.source_format:
+            raise ValueError("Audio packet format changed within a response")
+        data = packet.data
+        if self.resampler is not None:
+            data = self.resampler.process(data, final=False)
+        if len(data) > self.max_bytes:
             raise BufferError("Speaker output buffer exceeds two seconds")
-        self.queue.append(_Chunk(response_id, data))
-        self.queued_bytes += len(data)
+        while True:
+            with self.lock:
+                has_capacity = self.queued_bytes + len(data) <= self.max_bytes
+            if has_capacity:
+                break
+            self.space_available.clear()
+            await self.space_available.wait()
+        self._enqueue_data(response_id, data)
+
+    def _enqueue_data(self, response_id: str, data: bytes) -> None:
+        with self.lock:
+            if self.queued_bytes + len(data) > self.max_bytes:
+                raise BufferError("Speaker output buffer exceeds two seconds")
+            self.queue.append(_Chunk(response_id, data))
+            self.queued_bytes += len(data)
 
     def end_response(self, response_id: str) -> None:
+        with self.lock:
+            if self.resampler is not None:
+                tail = self.resampler.process(b"", final=True)
+                if tail:
+                    if self.queued_bytes + len(tail) > self.max_bytes:
+                        raise BufferError("Speaker output buffer exceeds two seconds")
+                    self.queue.append(_Chunk(response_id, tail))
+                    self.queued_bytes += len(tail)
+                self.resampler = self.resampler_factory(*self.resampler_factory_args)
+            self.queue.append(_Chunk(response_id, None))
+
+    async def end_response_async(self, response_id: str) -> None:
+        tail = b""
         if self.resampler is not None:
             tail = self.resampler.process(b"", final=True)
-            if tail:
-                if self.queued_bytes + len(tail) > self.max_bytes:
-                    raise BufferError("Speaker output buffer exceeds two seconds")
-                self.queue.append(_Chunk(response_id, tail))
-                self.queued_bytes += len(tail)
             self.resampler = self.resampler_factory(*self.resampler_factory_args)
-        self.queue.append(_Chunk(response_id, None))
+        if tail:
+            if len(tail) > self.max_bytes:
+                raise BufferError("Resampler tail exceeds speaker buffer")
+            while True:
+                with self.lock:
+                    has_capacity = self.queued_bytes + len(tail) <= self.max_bytes
+                if has_capacity:
+                    break
+                self.space_available.clear()
+                await self.space_available.wait()
+            self._enqueue_data(response_id, tail)
+        with self.lock:
+            self.queue.append(_Chunk(response_id, None))
 
     def clear(self) -> None:
-        self.queue.clear()
-        self.queued_bytes = 0
-        self.pending_ack = None
+        with self.lock:
+            self.queue.clear()
+            self.queued_bytes = 0
+            self.pending_ack = None
+        self.space_available.set()
 
     def _callback(self, outdata, frames, time_info, status) -> None:
         outdata[:] = self.render(frames)
@@ -121,31 +170,34 @@ class SoundDeviceOutput:
     def render(self, frames: int) -> bytes:
         if self.source_format is None:
             raise RuntimeError("Output device is not open")
-        self._publish_pending_ack()
-        size = frames * self.source_format.channels * 2
-        output = bytearray(size)
-        cursor = 0
-        while cursor < size and self.queue:
-            chunk = self.queue[0]
-            if chunk.data is None:
-                self.queue.popleft()
-                self.pending_ack = chunk.response_id
-                continue
-            count = min(size - cursor, len(chunk.data) - chunk.offset)
-            if count and chunk.response_id not in self.played_responses:
-                self.played_responses.add(chunk.response_id)
-                if self.on_first_audio:
-                    self.on_first_audio(chunk.response_id, self.monotonic())
-            output[cursor : cursor + count] = chunk.data[
-                chunk.offset : chunk.offset + count
-            ]
-            cursor += count
-            chunk.offset += count
-            self.queued_bytes -= count
-            if chunk.offset == len(chunk.data):
-                self.queue.popleft()
-        while self.queue and self.queue[0].data is None:
-            self.pending_ack = self.queue.popleft().response_id
+        with self.lock:
+            self._publish_pending_ack()
+            size = frames * self.source_format.channels * 2
+            output = bytearray(size)
+            cursor = 0
+            while cursor < size and self.queue:
+                chunk = self.queue[0]
+                if chunk.data is None:
+                    self.queue.popleft()
+                    self.pending_ack = chunk.response_id
+                    continue
+                count = min(size - cursor, len(chunk.data) - chunk.offset)
+                if count and chunk.response_id not in self.played_responses:
+                    self.played_responses.add(chunk.response_id)
+                    if self.on_first_audio:
+                        self.on_first_audio(chunk.response_id, self.monotonic())
+                output[cursor : cursor + count] = chunk.data[
+                    chunk.offset : chunk.offset + count
+                ]
+                cursor += count
+                chunk.offset += count
+                self.queued_bytes -= count
+                if self.loop is not None:
+                    self.loop.call_soon_threadsafe(self.space_available.set)
+                if chunk.offset == len(chunk.data):
+                    self.queue.popleft()
+            while self.queue and self.queue[0].data is None:
+                self.pending_ack = self.queue.popleft().response_id
         return bytes(output)
 
     def _publish_pending_ack(self) -> None:

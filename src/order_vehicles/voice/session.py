@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from datetime import datetime
 from typing import Protocol
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
@@ -17,6 +17,7 @@ from order_vehicles.speech.domain.errors import SpeechError
 
 from .protocol import (
     InputAudioEnd,
+    InputAudioAbort,
     InputAudioStart,
     PlaybackFinished,
     ResponseInterrupt,
@@ -77,6 +78,8 @@ class VoiceSessionService:
         self.timing_recorder = timing_recorder
         self.monotonic = monotonic
         self._connections: set[_VoiceConnection] = set()
+        self._active_sessions: dict[UUID, str] = {}
+        self._session_lock = asyncio.Lock()
 
     @property
     def active_task_count(self) -> int:
@@ -91,12 +94,28 @@ class VoiceSessionService:
             clock=self.clock,
             timing_recorder=self.timing_recorder,
             monotonic=self.monotonic,
+            claim_session=self._claim_session,
+            release_session=self._release_session,
         )
         self._connections.add(connection)
         try:
             await connection.run(socket)
         finally:
             self._connections.discard(connection)
+
+    async def _claim_session(self, session_id: UUID, owner: str) -> bool:
+        async with self._session_lock:
+            if session_id in self._active_sessions:
+                return False
+            self._active_sessions[session_id] = owner
+            return True
+
+    async def _release_session(self, session_id: UUID, owner: str) -> bool:
+        async with self._session_lock:
+            if self._active_sessions.get(session_id) != owner:
+                return False
+            del self._active_sessions[session_id]
+            return True
 
 
 class _VoiceConnection:
@@ -110,6 +129,8 @@ class _VoiceConnection:
         clock: Callable[[], datetime],
         timing_recorder=None,
         monotonic: Callable[[], float] = time.perf_counter,
+        claim_session=None,
+        release_session=None,
     ) -> None:
         self.runtime_service = runtime_service
         self.repository = repository
@@ -118,6 +139,9 @@ class _VoiceConnection:
         self.clock = clock
         self.timing_recorder = timing_recorder
         self.monotonic = monotonic
+        self.claim_session = claim_session
+        self.release_session = release_session
+        self.owner = secrets.token_urlsafe(16)
         self._background: set[asyncio.Task] = set()
         self._responses = ResponseTasks()
         self._generation = 0
@@ -133,6 +157,8 @@ class _VoiceConnection:
         session: CallSession | None = None
         turn_id: str | None = None
         frames: asyncio.Queue[bytes | None] | None = None
+        turn_bytes = 0
+        claimed = False
         try:
             first = parse_client_event(await socket.receive())
             if isinstance(first, SessionStart):
@@ -140,7 +166,7 @@ class _VoiceConnection:
                 session.resume_token = secrets.token_urlsafe(24)
                 self.repository.save(session, expected_revision=session.revision)
             elif isinstance(first, SessionResume):
-                session = self.repository.get(first.session_id)
+                session = self.repository.get(first.session_id, self.clock())
                 if not secrets.compare_digest(session.resume_token or "", first.resume_token):
                     await self._error(writer, "INVALID_RESUME_TOKEN", "Resume token is invalid")
                     await socket.close(code=1008)
@@ -152,6 +178,11 @@ class _VoiceConnection:
                 await socket.close(code=1008)
                 return
 
+            if self.claim_session and not await self.claim_session(session.session_id, self.owner):
+                await self._error(writer, "SESSION_ACTIVE", "Session already has an active connection")
+                await socket.close(code=1008)
+                return
+            claimed = True
             writer.bind_session(session.session_id)
             await writer.json(
                 {
@@ -164,7 +195,20 @@ class _VoiceConnection:
             )
 
             async with self.runtime_service.open() as runtime:
-                if not session.last_asked_field:
+                if session.status.value == "COMPLETED" and session.final_payload:
+                    await writer.json(
+                        {"type": "booking.confirmed", "payload": session.final_payload}
+                    )
+                    await self._start_response(
+                        writer,
+                        runtime,
+                        session,
+                        DialogueDecision(
+                            kind="complete", text="Thông tin đã được xác nhận."
+                        ),
+                        self._generation,
+                    )
+                elif not session.last_asked_field:
                     session.last_asked_field = "name"
                     self.repository.save(session, expected_revision=session.revision)
                     await self._start_response(
@@ -185,21 +229,27 @@ class _VoiceConnection:
                         if frames is None:
                             await self._error(writer, "INPUT_TURN_NOT_OPEN", "Binary audio requires an open input turn")
                         else:
-                            try:
-                                frames.put_nowait(raw)
-                            except asyncio.QueueFull:
-                                self._generation += 1
-                                await self._error(
-                                    writer,
-                                    "INPUT_OVERFLOW",
-                                    "Input audio buffer overflowed; repeat the turn",
-                                    retryable=True,
+                            if len(raw) % 2 or len(raw) > 4096 or turn_bytes + len(raw) > 960_000:
+                                await self._abort_turn(
+                                    writer, frames, "INPUT_AUDIO_INVALID", "PCM frame or turn exceeds its byte budget"
                                 )
-                                while not frames.empty():
-                                    frames.get_nowait()
-                                frames.put_nowait(None)
                                 frames = None
                                 turn_id = None
+                                turn_bytes = 0
+                                continue
+                            try:
+                                frames.put_nowait(raw)
+                                turn_bytes += len(raw)
+                            except asyncio.QueueFull:
+                                await self._abort_turn(
+                                    writer,
+                                    frames,
+                                    "INPUT_OVERFLOW",
+                                    "Input audio buffer overflowed; repeat the turn",
+                                )
+                                frames = None
+                                turn_id = None
+                                turn_bytes = 0
                         continue
                     try:
                         event = parse_client_event(raw)
@@ -216,11 +266,15 @@ class _VoiceConnection:
                         continue
 
                     if isinstance(event, InputAudioStart):
+                        if session.status.value in {"COMPLETED", "CANCELLED", "NEEDS_ASSISTANCE"}:
+                            await self._error(writer, "SESSION_TERMINAL", "Terminal sessions do not accept new turns")
+                            continue
                         if frames is not None:
                             await self._error(writer, "INPUT_TURN_ACTIVE", "Input turns must be serial")
                             continue
-                        await self._interrupt(writer)
+                        await self._interrupt(writer, session)
                         turn_id = event.turn_id
+                        turn_bytes = 0
                         frames = asyncio.Queue(maxsize=100)
                         generation = self._generation
                         self._turn_ids[generation] = event.turn_id
@@ -234,14 +288,26 @@ class _VoiceConnection:
                         if frames is None or event.turn_id != turn_id:
                             await self._error(writer, "INPUT_TURN_MISMATCH", "Input turn is not active")
                             continue
-                        await frames.put(None)
+                        try:
+                            frames.put_nowait(None)
+                        except asyncio.QueueFull:
+                            await self._abort_turn(writer, frames, "INPUT_OVERFLOW", "Input queue is full")
                         timing = self._timings.get(self._generation)
                         if timing:
                             timing.mark("input.end", self.monotonic())
                         frames = None
                         turn_id = None
+                        turn_bytes = 0
+                    elif isinstance(event, InputAudioAbort):
+                        if frames is None or event.turn_id != turn_id:
+                            await self._error(writer, "INPUT_TURN_MISMATCH", "Input turn is not active")
+                            continue
+                        await self._abort_turn(writer, frames, "INPUT_ABORTED", event.reason)
+                        frames = None
+                        turn_id = None
+                        turn_bytes = 0
                     elif isinstance(event, ResponseInterrupt):
-                        await self._interrupt(writer)
+                        await self._interrupt(writer, session)
                     elif isinstance(event, PlaybackFinished):
                         self.dialogue.mark_playback_finished(session, event.response_id)
                         self.repository.save(session, expected_revision=session.revision)
@@ -249,6 +315,11 @@ class _VoiceConnection:
                         await self._error(writer, "SESSION_ALREADY_STARTED", "Session is already active")
         except (asyncio.CancelledError, KeyboardInterrupt):
             raise
+        except SpeechError as exc:
+            with suppress(Exception):
+                await self._error(writer, exc.code, exc.message, exc.retryable)
+                if session is None:
+                    await socket.close(code=1008)
         except Exception as exc:
             if session is None:
                 with suppress(Exception):
@@ -260,7 +331,10 @@ class _VoiceConnection:
                 with suppress(asyncio.QueueFull):
                     frames.put_nowait(None)
             await self._close_tasks()
-            if session is not None:
+            released = bool(session is not None and claimed)
+            if released and self.release_session:
+                released = await self.release_session(session.session_id, self.owner)
+            if session is not None and released:
                 with suppress(Exception):
                     self.repository.detach(session.session_id, self.clock())
 
@@ -280,6 +354,7 @@ class _VoiceConnection:
                 yield frame
 
         try:
+            saw_summary = False
             async for event in runtime.transcribe(source()):
                 if generation != self._generation:
                     return
@@ -293,6 +368,10 @@ class _VoiceConnection:
                     }
                 )
                 if event.kind == "final" and event.final_kind == "summary":
+                    saw_summary = True
+                    if not event.text.strip():
+                        await self._repeat_prompt(runtime, writer, session, generation)
+                        return
                     timing = self._timings.get(generation)
                     if timing:
                         timing.mark("stt.final", self.monotonic())
@@ -300,6 +379,8 @@ class _VoiceConnection:
                         runtime, writer, session, event.text, generation
                     )
                     return
+            if not saw_summary and generation == self._generation:
+                await self._repeat_prompt(runtime, writer, session, generation)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -355,13 +436,45 @@ class _VoiceConnection:
         )
         await self._responses.start(
             response_id,
-            self._emit_response(
+            self._response_work(
                 writer,
                 runtime,
                 decision,
                 response_id,
                 generation,
             ),
+        )
+
+    async def _response_work(
+        self, writer, runtime, decision, response_id: str, generation: int
+    ) -> None:
+        try:
+            await self._emit_response(
+                writer, runtime, decision, response_id, generation
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if generation == self._generation:
+                await self._error(writer, "TTS_FAILED", str(exc), retryable=True)
+                await writer.json(
+                    {
+                        "type": "assistant.response.failed",
+                        "response_id": response_id,
+                    }
+                )
+
+    async def _repeat_prompt(self, runtime, writer, session, generation) -> None:
+        await self._start_response(
+            writer,
+            runtime,
+            session,
+            DialogueDecision(
+                kind="ask",
+                field=session.last_asked_field,
+                text="Tôi chưa nghe rõ. Bạn vui lòng nói lại.",
+            ),
+            generation,
         )
 
     async def _emit_response(
@@ -434,17 +547,34 @@ class _VoiceConnection:
                     },
                 )
 
-    async def _interrupt(self, writer: _SerializedWriter) -> None:
+    async def _interrupt(self, writer: _SerializedWriter, session: CallSession) -> None:
         old_response = self._responses.response_id
         old_generation = self._generation
         self._generation += 1
         self._timings.pop(old_generation, None)
         self._turn_ids.pop(old_generation, None)
         await self._responses.interrupt()
+        if (
+            old_response
+            and old_response == session.confirmation_response_id
+            and not session.playback_finished
+        ):
+            self.dialogue.invalidate_confirmation(session)
+            self.repository.save(session, expected_revision=session.revision)
         if old_response:
             await writer.json(
                 {"type": "assistant.response.interrupted", "response_id": old_response}
             )
+
+    async def _abort_turn(self, writer, frames, code: str, message: str) -> None:
+        old_generation = self._generation
+        self._generation += 1
+        self._timings.pop(old_generation, None)
+        self._turn_ids.pop(old_generation, None)
+        while not frames.empty():
+            frames.get_nowait()
+        frames.put_nowait(None)
+        await self._error(writer, code, message, retryable=True)
 
     def _track(self, coroutine) -> None:
         task = asyncio.create_task(coroutine)

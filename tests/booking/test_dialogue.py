@@ -51,3 +51,30 @@ def test_third_failed_answer_requires_assistance(session, now, uuid_factory) -> 
 def test_cancel_never_exports(session, now, uuid_factory) -> None:
     decision = manager(uuid_factory).handle(session, ExtractionResult(patch=complete_now(), intent="cancel"), now)
     assert decision.kind == "cancel" and decision.payload is None
+
+
+def test_terminal_session_cannot_be_corrected(session, now, uuid_factory) -> None:
+    dialogue = manager(uuid_factory)
+    dialogue.handle(session, ExtractionResult(patch=complete_now()), now)
+    dialogue.mark_playback_finished(session, session.confirmation_response_id)
+    done = dialogue.handle(session, ExtractionResult(intent="affirm"), now)
+    revision = session.revision
+    again = dialogue.handle(
+        session,
+        ExtractionResult(patch=BookingPatch(name="Lan"), intent="correct"),
+        now,
+    )
+    assert done.payload == again.payload
+    assert session.fields["name"].value == "Nam" and session.revision == revision
+
+
+def test_invalid_provided_value_counts_toward_assistance(session, now, uuid_factory) -> None:
+    dialogue = manager(uuid_factory)
+    dialogue.handle(session, ExtractionResult(patch=BookingPatch(name="Nam")), now)
+    for _ in range(3):
+        decision = dialogue.handle(
+            session,
+            ExtractionResult(patch=BookingPatch(phone="12"), intent="provide"),
+            now,
+        )
+    assert decision.kind == "assist"

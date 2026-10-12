@@ -41,6 +41,13 @@ class InputAudioEnd(ProtocolModel):
     turn_id: str = Field(min_length=1)
 
 
+class InputAudioAbort(ProtocolModel):
+    type: Literal["input_audio.abort"]
+    session_id: UUID | None = None
+    turn_id: str = Field(min_length=1)
+    reason: Literal["overflow", "cancelled"] = "cancelled"
+
+
 class ResponseInterrupt(ProtocolModel):
     type: Literal["response.interrupt"]
     session_id: UUID | None = None
@@ -57,6 +64,7 @@ ClientEvent = Annotated[
     | SessionResume
     | InputAudioStart
     | InputAudioEnd
+    | InputAudioAbort
     | ResponseInterrupt
     | PlaybackFinished,
     Field(discriminator="type"),

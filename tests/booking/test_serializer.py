@@ -37,3 +37,12 @@ def test_repository_expires_draft_after_15_minutes(now, uuid_factory) -> None:
     repository.detach(session.session_id, now)
     repository.expire(now + timedelta(seconds=901))
     with pytest.raises(SpeechError): repository.get(session.session_id)
+
+
+def test_repository_rejects_expired_session_on_read(now, uuid_factory) -> None:
+    repository = SessionRepository(["car"], uuid_factory=uuid_factory)
+    session = repository.create("")
+    repository.detach(session.session_id, now)
+    with pytest.raises(SpeechError) as caught:
+        repository.get(session.session_id, now + timedelta(minutes=16))
+    assert caught.value.code == "SESSION_EXPIRED"

@@ -84,8 +84,6 @@ class SoundDeviceInput:
             self.loop.call_soon_threadsafe(self._mark_overflow)
             return
         data = bytes(indata)
-        if self.resampler is not None:
-            data = self.resampler.process(data, final=False)
         self.loop.call_soon_threadsafe(self._offer, data)
 
     def _mark_overflow(self) -> None:
@@ -113,6 +111,8 @@ class SoundDeviceInput:
                 return
             if isinstance(item, Exception):
                 raise item
+            if self.resampler is not None:
+                item = self.resampler.process(item, final=False)
             yield item
             if self._overflow:
                 self._overflow = False

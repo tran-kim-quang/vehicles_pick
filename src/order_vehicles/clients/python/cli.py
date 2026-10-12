@@ -5,6 +5,7 @@ from typing import Annotated
 
 import typer
 
+from order_vehicles.observability.timing import TimingRecorder
 from order_vehicles.settings import Settings
 
 from .management import ManagementClient
@@ -61,6 +62,7 @@ def mic(
 ) -> None:
     """Run the microphone booking client."""
     settings = Settings()
+    timings = TimingRecorder()
     threshold = settings.vad_threshold if vad_threshold is None else vad_threshold
     client = PythonMicClient(
         writer=AtomicBookingWriter(settings.output_dir),
@@ -68,6 +70,7 @@ def mic(
             EnergyVAD(threshold),
             max_turn_ms=round(settings.max_turn_seconds * 1000),
         ),
+        timing_recorder=timings,
     )
     try:
         asyncio.run(
@@ -75,6 +78,10 @@ def mic(
         )
     except KeyboardInterrupt:
         typer.echo("Đã dừng.")
+    finally:
+        summary = timings.summary()
+        if summary:
+            typer.echo(json.dumps({"timings": summary}, ensure_ascii=False, indent=2))
 
 
 @models_app.command("list")

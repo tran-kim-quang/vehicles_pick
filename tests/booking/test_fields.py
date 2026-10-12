@@ -66,3 +66,15 @@ def test_relative_day_uses_service_timezone(session, now, uuid_factory) -> None:
 def test_eight_without_period_requires_clarification(session, now, uuid_factory) -> None:
     errors = registry(uuid_factory).apply(session, BookingPatch(booking_mode="scheduled", schedule=ScheduleProposal(relative_days=1, hour=8)), now)
     assert "scheduled_at" in errors
+
+
+def test_midnight_is_unambiguous_24_hour_time(session, now, uuid_factory) -> None:
+    errors = registry(uuid_factory).apply(
+        session,
+        BookingPatch(
+            booking_mode="scheduled",
+            schedule=ScheduleProposal(relative_days=1, hour=0),
+        ),
+        now,
+    )
+    assert errors == []
