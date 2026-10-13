@@ -28,6 +28,8 @@ OV_VEHICLES_AVAILABLE=["bike","car"]
 
 LLM endpoint phải tương thích `POST /chat/completions`. Không có provider mặc định: server chỉ bật voice booking khi cả URL và model đã được cấu hình. Nếu backend hỗ trợ JSON mode, đặt `OV_LLM_STRUCTURED_OUTPUT=true`; kết quả vẫn được Pydantic và domain validators kiểm tra tại service.
 
+Với Groq, đặt `OV_LLM_BASE_URL=https://api.groq.com/openai/v1` (không thêm `/chat/completions`). LLM này vừa trích xuất dữ liệu vừa diễn đạt lời đáp: ghi nhận thông tin mới và hỏi trường còn thiếu. Domain vẫn quyết định bước hỏi/xác nhận; bản đọc lại xác nhận đầy đủ được nối vào lời dẫn của LLM. Nếu sinh lời đáp lỗi hoặc hết thời gian, bot dùng câu mẫu. Số điện thoại sai được phản hồi bằng câu sửa lỗi do domain kiểm soát. Điểm đón `pickup` và điểm đến `destination` được lưu, đọc lại và xuất JSON; khi đã cung cấp một đầu thì đầu còn lại bắt buộc. Các phiên không cung cấp tuyến đường vẫn giữ luồng cũ. Địa điểm chỉ được kiểm tra không rỗng, chưa xác minh bằng bản đồ. Khởi động lại `ov server` sau khi cập nhật mã hoặc `.env`.
+
 ## Chuẩn bị speech profile và giọng
 
 Kiểm tra/cài model, sau đó chọn engine/model trong runtime profile:
@@ -51,6 +53,18 @@ uv run ov voices preview <voice-ref> "Tôi xin xác nhận thông tin" --output 
 VieNeu-TTS hoặc provider bên thứ ba cần adapter thực thi cùng `SpeechSynthesizer` contract. Không đưa một checkpoint `.pt` tùy ý vào VoiceStudio nếu engine không có loader tương ứng với kiến trúc đó.
 
 ## Chạy
+
+### VieNeu Cloud TTS + VoiceStudio STT
+
+Greeting đầu phiên: `xin chào, mình có thể giúp gì cho bạn ạ`. WAV tạo sẵn ở `assets/greeting.wav`, có thể đổi đường dẫn bằng `OV_GREETING_AUDIO_PATH`. Server nạp file lúc khởi động để phát ngay và không gọi cloud mỗi phiên; nếu chưa có file thì dùng TTS. Sau khi đổi voice, cần tạo lại greeting và khởi động lại server. PCM gửi tới client được chia thành các gói tối đa 100 ms để phù hợp hàng đợi loa hai giây.
+
+Trong `.env`, đặt `OV_TTS_PROVIDER=vieneu`, `OV_VIENEU_MODEL=vieneu-v4`, `OV_VIENEU_VOICE=Ngọc Lan`. Key đọc từ `OV_VIENEU_API_KEY` hoặc biến hiện có `TTS_API_KEY`; URL đọc từ `OV_VIENEU_BASE_URL` hoặc `BASE_URL_TTS` (API base chính thức: `https://api.vieneu.io/api/v1`). Không đưa key vào file mẫu hoặc log. Danh sách voice: `GET https://api.vieneu.io/api/v1/voices?engine=v4`.
+
+STT vẫn lấy từ `state/speech-profile.json`. Khi chọn VieNeu, runtime thay TTS và voice theo `.env`; voice ID VoiceStudio như `36fc8123` không dùng được cho VieNeu. Speech-management CLI vẫn quản lý VoiceStudio. Muốn quay lại TTS local, đặt `OV_TTS_PROVIDER=voicestudio` và khởi động lại server.
+
+VieNeu trả WAV hoàn chỉnh qua `POST /api/v1/audio/speech`; adapter lấy sample rate từ header WAV rồi chuyển PCM16 cho client. Hiện chưa streaming từng phần. Thời gian chờ mặc định `OV_VIENEU_TIMEOUT_SECONDS=120`. VieNeu Cloud tính phí ký tự theo tài khoản; khóa và hạn mức do VieNeu quản lý.
+
+Lịch đặt trước giữ giờ/phút qua các lượt; chỉ nói giờ thì phút mặc định 00 và bot hỏi ngày. Ngày không kèm tháng/năm dùng tháng/năm hiện tại theo `OV_SERVICE_TIMEZONE`. Backend từ chối lịch quá khứ và lịch thuộc tháng/năm khác. JSON xác nhận có `booking_at` dạng ISO 8601 với offset timezone: thời điểm xác nhận cho đi ngay, lịch đã kiểm tra cho đặt trước. Voice đang chọn nằm trong `state/speech-profile.json` (`voice_ref.provider_voice_id`, `voice_ref.kind`, `language`); nên cập nhật qua `ov profile set` khi server đang chạy.
 
 Terminal server:
 
@@ -79,6 +93,8 @@ uv run pytest tests/speech -q
 Các scenario gồm đủ field trong một lượt, đặt trước thiếu giờ, xe ngoài catalog, sửa trong lúc xác nhận, hủy, clone/archetype, timeout và race khi ngắt lời.
 
 ## Live micro và timing
+
+Voice `design` dùng `POST /generate` với `profile_id` để backend phục hồi reference, chỉ dẫn và seed đã lưu giống giao diện. Audio được trả sau khi tạo xong toàn câu; không có streaming từng câu như `/ws/tts`. Voice clone vẫn dùng `/ws/tts`. Chọn `language=vi` để đọc tiếng Việt; mẫu thiết kế bằng tiếng Anh có thể ảnh hưởng giọng/phát âm và cần nghe đối chiếu với reference.
 
 Chuẩn bị model STT/TTS, LLM, giọng, tai nghe và thiết bị audio. Chạy test tương tác sau, nói đủ tên, số điện thoại, đặt ngay/đặt trước và loại xe, rồi xác nhận:
 

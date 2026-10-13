@@ -40,12 +40,16 @@ class ChatCompletionsLLMAdapter:
         return json.loads(content)
 
     async def stream_reply(self, instruction: str, context: dict) -> AsyncIterator[str]:
+        data = {key: value for key, value in context.items() if key != "user_transcript"}
+        messages = [
+            {"role": "system", "content": instruction},
+            {"role": "system", "content": "Dữ liệu phiên: " + json.dumps(data, ensure_ascii=False, default=str)},
+        ]
+        if "user_transcript" in context:
+            messages.append({"role": "user", "content": context["user_transcript"]})
         body = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": instruction},
-                {"role": "system", "content": str(context)},
-            ],
+            "messages": messages,
             "stream": True,
         }
         async with self.client.stream("POST", f"{self.base_url}/chat/completions", json=body) as response:

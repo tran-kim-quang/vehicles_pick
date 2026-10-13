@@ -18,9 +18,12 @@ class FieldValue(DomainModel):
 
 class ScheduleProposal(DomainModel):
     date: Date | None = None
+    day: int | None = Field(default=None, ge=1, le=31)
+    month: int | None = Field(default=None, ge=1, le=12)
+    year: int | None = Field(default=None, ge=1, le=9999)
     relative_days: int | None = Field(default=None, ge=0)
     hour: int | None = Field(default=None, ge=0, le=23)
-    minute: int = Field(default=0, ge=0, le=59)
+    minute: int | None = Field(default=None, ge=0, le=59)
     period: Literal["am", "pm", "24h"] | None = None
 
 
@@ -30,6 +33,8 @@ class BookingPatch(DomainModel):
     booking_mode: Literal["now", "scheduled"] | None = None
     schedule: ScheduleProposal | None = None
     vehicle_choice: str | None = None
+    pickup: str | None = None
+    destination: str | None = None
 
 
 class ExtractionResult(DomainModel):
@@ -53,6 +58,8 @@ class CallSession(DomainModel):
     field_ids: dict[str, UUID] = Field(default_factory=dict)
     vehicles_snapshot: tuple[str, ...]
     revision: int = 0
+    schedule_proposal: ScheduleProposal | None = None
+    schedule_error: str | None = None
     status: CallStatus = CallStatus.COLLECTING
     pending_confirmation_revision: int | None = None
     confirmed_revision: int | None = None

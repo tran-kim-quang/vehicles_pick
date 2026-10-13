@@ -5,7 +5,7 @@ from order_vehicles.speech.application.management import SpeechManagementService
 from order_vehicles.speech.application.profiles import JsonRuntimeProfileRepository
 from order_vehicles.speech.application.runtime import SpeechRuntimeService
 from order_vehicles.speech.domain.errors import SpeechError
-from order_vehicles.speech.domain.models import ModelSelection, RuntimeProfile
+from order_vehicles.speech.domain.models import ModelSelection, RuntimeProfile, VoiceRef
 
 
 class FakeRecognizer:
@@ -26,6 +26,26 @@ class FakeModelManager:
 
     async def select_model(self, selection):
         return self.selection
+
+
+@pytest.mark.asyncio
+async def test_cloud_tts_override_preserves_voicestudio_stt_and_saved_profile(tmp_path):
+    repository = JsonRuntimeProfileRepository(tmp_path / "profile.json")
+    recognizer, cloud = FakeRecognizer(), FakeSynthesizer()
+    stored = repository.get()
+    svc = SpeechRuntimeService(
+        repository, ResourceLeases(), {"vieneu": (recognizer, cloud)},
+        readiness=lambda _: True,
+        profile_overrides={
+            "voice_ref": VoiceRef(provider_id="vieneu", kind="preset", provider_voice_id="Ngọc Lan"),
+            "tts": ModelSelection(engine_id="vieneu", model_id="vieneu-v4", purpose="tts"),
+        },
+    )
+    async with svc.open() as runtime:
+        assert runtime.recognizer is recognizer and runtime.synthesizer is cloud
+        assert runtime.profile.stt == stored.stt
+        assert runtime.profile.tts.engine_id == "vieneu"
+    assert repository.get() == stored
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,7 @@ class InformationExtractor:
             "vehicles_available": list(session.vehicles_snapshot),
             "validated_fields": fields,
             "pending_question": session.last_asked_field,
+            "partial_schedule": session.schedule_proposal.model_dump(mode="json") if session.schedule_proposal else None,
             "service_timestamp": current.isoformat(),
             "timezone": timezone,
         }

@@ -1,4 +1,7 @@
 import json
+import io
+import wave
+import httpx
 
 import pytest
 
@@ -25,6 +28,32 @@ def client_for(tmp_path, connector: ScriptedConnector) -> VoiceStudioClient:
         Settings(state_dir=tmp_path / "s", output_dir=tmp_path / "o"),
         websocket_connector=connector,
     )
+
+
+@pytest.mark.asyncio
+async def test_design_voice_uses_ui_generation_with_saved_profile(tmp_path):
+    wav = io.BytesIO()
+    with wave.open(wav, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(24000)
+        out.writeframes(b"\x01\x00\x02\x00")
+
+    async def handler(request):
+        assert request.url.path == "/generate"
+        body = request.content.decode()
+        assert "profile_id=36fc8123" in body and "language=vi" in body
+        assert "seed=" not in body  # The backend restores the saved profile seed.
+        return httpx.Response(200, content=wav.getvalue(), headers={"content-type": "audio/wav"})
+
+    client = VoiceStudioClient(Settings(), transport=httpx.MockTransport(handler), websocket_connector=ScriptedConnector([[]]))
+    settings = config().model_copy(update={"voice_ref": VoiceRef(provider_id="voicestudio", kind="design", provider_voice_id="36fc8123")})
+    try:
+        packets = [p async for p in VoiceStudioTTSAdapter(client).stream_synthesize("Xin chào", settings)]
+        assert packets[0].format.sample_rate == 24000
+        assert packets[0].data == b"\x01\x00\x02\x00"
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio

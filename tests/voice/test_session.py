@@ -60,6 +60,56 @@ async def test_summary_creates_one_domain_turn(uuid_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_greeting_and_large_audio_are_sent_in_small_packets(uuid_factory):
+    from order_vehicles.speech.greeting import GREETING_TEXT
+
+    pcm = b"\x01\x00" * 48000 * 3
+    class Runtime(FakeRuntime):
+        async def speak(self, text):
+            assert text == GREETING_TEXT
+            yield AudioPacket(format=AudioFormat(sample_rate=48000), data=pcm)
+
+    svc, _ = service(Runtime(), FakeExtractor([]), uuid_factory)
+    socket = FakeSocket()
+    task = asyncio.create_task(svc.run(socket))
+    await socket.push(START)
+    await socket.wait_for(lambda e: e["type"] == "assistant.audio.end")
+    audio = [item for item in socket.sent if isinstance(item, bytes)]
+    assert len(audio) > 1 and max(map(len, audio)) <= 9600
+    assert b"".join(audio) == pcm
+    assert any(e.get("text") == GREETING_TEXT for e in socket.sent if isinstance(e, dict))
+    await socket.push(None)
+    await task
+
+
+@pytest.mark.asyncio
+async def test_llm_reply_is_sent_to_client_and_tts(uuid_factory) -> None:
+    runtime = FakeRuntime(["đặt xe ngay"])
+    extractor = FakeExtractor([ExtractionResult(patch=BookingPatch(booking_mode="now"))])
+
+    class Responder:
+        async def respond(self, transcript, session, decision, previous_fields):
+            assert transcript == "đặt xe ngay"
+            assert session.fields["booking_mode"].value == "now"
+            assert previous_fields == {}
+            return decision.model_copy(update={"text": "Bạn muốn đi ngay. Cho mình xin tên nhé?"})
+
+    svc, _ = service(runtime, extractor, uuid_factory)
+    svc.responder = Responder()
+    socket = FakeSocket()
+    task = asyncio.create_task(svc.run(socket))
+    await socket.push(START)
+    await socket.wait_for(lambda e: e["type"] == "session.started")
+    await start_turn(socket)
+    reply = await socket.wait_for(lambda e: e["type"] == "assistant.audio.end" and e.get("turn_id") == "turn-1")
+    assert reply
+    assert runtime.spoken[-1] == "Bạn muốn đi ngay. Cho mình xin tên nhé?"
+    assert any(e.get("text") == runtime.spoken[-1] for e in socket.sent if isinstance(e, dict))
+    await socket.push(None)
+    await task
+
+
+@pytest.mark.asyncio
 async def test_binary_outside_open_input_turn_is_rejected(uuid_factory) -> None:
     svc, _ = service(FakeRuntime(), FakeExtractor([]), uuid_factory)
     socket = FakeSocket()

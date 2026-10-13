@@ -9,6 +9,16 @@ def registry(uuid_factory):
     return FieldRegistry(uuid_factory=uuid_factory)
 
 
+def test_route_is_saved_and_missing_other_endpoint_is_asked(session, now, uuid_factory):
+    fields = registry(uuid_factory)
+    fields.apply(session, BookingPatch(pickup=" ABC "), now)
+    assert session.fields["pickup"].value == "ABC"
+    assert "destination" in fields.missing_fields(session)
+    fields.apply(session, BookingPatch(destination="Z"), now)
+    assert session.fields["destination"].value == "Z"
+    assert "destination" not in fields.missing_fields(session)
+
+
 def test_complete_now_patch(session, now, uuid_factory) -> None:
     errors = registry(uuid_factory).apply(session, BookingPatch(name=" Nam ", phone="0901234567", booking_mode="now", vehicle_choice="car"), now)
     assert errors == []
@@ -63,9 +73,10 @@ def test_relative_day_uses_service_timezone(session, now, uuid_factory) -> None:
     assert session.fields["scheduled_at"].value.isoformat() == "2026-10-13T13:00:00+07:00"
 
 
-def test_eight_without_period_requires_clarification(session, now, uuid_factory) -> None:
+def test_eight_without_period_uses_24_hour_clock(session, now, uuid_factory) -> None:
     errors = registry(uuid_factory).apply(session, BookingPatch(booking_mode="scheduled", schedule=ScheduleProposal(relative_days=1, hour=8)), now)
-    assert "scheduled_at" in errors
+    assert errors == []
+    assert session.fields["scheduled_at"].value.hour == 8
 
 
 def test_midnight_is_unambiguous_24_hour_time(session, now, uuid_factory) -> None:

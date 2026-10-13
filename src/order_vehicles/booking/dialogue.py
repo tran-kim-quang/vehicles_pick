@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .confirmation import confirmation_text
 from .fields import FieldRegistry
@@ -15,6 +15,7 @@ class DialogueDecision(BaseModel):
     text: str
     field: str | None = None
     payload: dict | None = None
+    validation_errors: list[str] = Field(default_factory=list)
 
 
 QUESTIONS = {
@@ -23,6 +24,8 @@ QUESTIONS = {
     "booking_mode": "Bạn muốn đi ngay hay đặt trước?",
     "scheduled_at": "Bạn muốn đặt xe lúc mấy giờ, ngày nào?",
     "vehicle_type": "Bạn muốn đi bike hay car?",
+    "pickup": "Bạn muốn đón xe ở đâu?",
+    "destination": "Bạn muốn đi đến đâu?",
 }
 
 
@@ -67,7 +70,21 @@ class DialogueManager:
                 session.status = CallStatus.NEEDS_ASSISTANCE
                 return DialogueDecision(kind="assist", text="Tôi sẽ chuyển bạn sang hỗ trợ viên.")
             session.status = CallStatus.COLLECTING
-            return DialogueDecision(kind="ask", field=field, text=QUESTIONS[field])
+            text = QUESTIONS[field]
+            if field == "scheduled_at" and session.schedule_proposal:
+                proposal = session.schedule_proposal
+                if session.schedule_error == "date and time are required":
+                    if proposal.hour is not None:
+                        text = f"Mình đã ghi nhận giờ {proposal.hour:02d}:{proposal.minute or 0:02d}. Bạn muốn đặt xe ngày nào trong tháng này?"
+                    else:
+                        text = "Bạn muốn đặt xe lúc mấy giờ, bao nhiêu phút?"
+                elif session.schedule_error:
+                    text = session.schedule_error + " Bạn vui lòng cung cấp lại ngày và giờ hợp lệ nhé."
+            if "phone" in errors:
+                text = "Số điện thoại không đúng định dạng. Bạn vui lòng cung cấp lại số điện thoại hợp lệ nhé."
+                if field != "phone":
+                    text += " " + QUESTIONS[field]
+            return DialogueDecision(kind="ask", field=field, text=text, validation_errors=errors)
 
         if result.intent == "affirm" and not changed:
             if (

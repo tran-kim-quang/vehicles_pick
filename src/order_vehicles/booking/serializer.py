@@ -1,4 +1,5 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from order_vehicles.speech.domain.errors import SpeechError
 
@@ -29,6 +30,10 @@ class BookingSerializer:
             "revision": session.revision,
             "confirmed_revision": session.confirmed_revision,
             "timezone": self.timezone_name,
+            "booking_at": (
+                session.fields["scheduled_at"].value if session.fields["booking_mode"].value == "scheduled"
+                else now.astimezone(ZoneInfo(self.timezone_name))
+            ).isoformat(),
             "fields": fields,
         }
         self._emitted.add(key)

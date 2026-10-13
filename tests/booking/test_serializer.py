@@ -29,6 +29,7 @@ def test_serializer_emits_once(session, now, uuid_factory) -> None:
 def test_now_omits_scheduled_at(session, now, uuid_factory) -> None:
     _, _, payload = completed(session, now, uuid_factory)
     assert "scheduled_at" not in payload["fields"]
+    assert payload["booking_at"] == now.isoformat()
 
 
 def test_repository_expires_draft_after_15_minutes(now, uuid_factory) -> None:

@@ -12,6 +12,25 @@ def complete_now():
     return BookingPatch(name="Nam", phone="0901234567", booking_mode="now", vehicle_choice="car")
 
 
+def test_invalid_phone_explains_format_and_requests_replacement(session, now, uuid_factory):
+    decision = manager(uuid_factory).handle(session, ExtractionResult(patch=BookingPatch(name="Quang", phone="01245")), now)
+    assert decision.field == "phone"
+    assert "phone" in decision.validation_errors
+    assert "không đúng định dạng" in decision.text
+    assert "cung cấp lại" in decision.text
+
+
+def test_route_is_in_confirmation_and_final_payload(session, now, uuid_factory):
+    dialogue = manager(uuid_factory)
+    patch = complete_now().model_copy(update={"pickup": "ABC", "destination": "Z"})
+    readback = dialogue.handle(session, ExtractionResult(patch=patch), now)
+    assert "từ ABC đến Z" in readback.text
+    dialogue.mark_playback_finished(session, session.confirmation_response_id)
+    done = dialogue.handle(session, ExtractionResult(intent="affirm"), now)
+    assert done.payload["fields"]["pickup"]["value"] == "ABC"
+    assert done.payload["fields"]["destination"]["value"] == "Z"
+
+
 def test_asks_only_missing_field(session, now, uuid_factory) -> None:
     decision = manager(uuid_factory).handle(session, ExtractionResult(patch=BookingPatch(name="Nam"), intent="provide"), now)
     assert decision.kind == "ask" and decision.field == "phone"

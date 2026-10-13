@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from order_vehicles.speech.domain.errors import SpeechError
+from order_vehicles.speech.greeting import GREETING_TEXT
 from order_vehicles.speech.domain.models import (
     AudioPacket,
     RuntimeProfile,
@@ -20,6 +21,7 @@ class SpeechRuntime:
     profile: RuntimeProfile
     recognizer: Any
     synthesizer: Any
+    greeting_audio: AudioPacket | None = None
     _active_streams: set[Any] = field(default_factory=set)
 
     async def transcribe(self, frames) -> AsyncIterator[TranscriptionEvent]:
@@ -33,6 +35,9 @@ class SpeechRuntime:
             self._active_streams.discard(stream)
 
     async def speak(self, text: str) -> AsyncIterator[AudioPacket]:
+        if text == GREETING_TEXT and self.greeting_audio is not None:
+            yield self.greeting_audio
+            return
         stream = self.synthesizer.stream_synthesize(text, self.profile.speech_config())
         self._active_streams.add(stream)
         try:
@@ -57,15 +62,20 @@ class SpeechRuntimeService:
         providers: dict[str, tuple[Any, Any]],
         *,
         readiness: Callable[[RuntimeProfile], bool | Awaitable[bool]],
+        profile_overrides: dict | None = None,
+        greeting_audio: AudioPacket | None = None,
     ) -> None:
         self.repository = repository
         self.leases = leases
         self.providers = providers
         self.readiness = readiness
+        self.profile_overrides = profile_overrides or {}
+        self.greeting_audio = greeting_audio
 
     @asynccontextmanager
     async def open(self, profile: RuntimeProfile | None = None):
         snapshot = (profile or self.repository.get()).model_copy(deep=True)
+        snapshot = snapshot.model_copy(update=self.profile_overrides)
         ready = self.readiness(snapshot)
         if inspect.isawaitable(ready):
             ready = await ready
@@ -83,7 +93,7 @@ class SpeechRuntimeService:
                 "UNKNOWN_PROVIDER", f"No speech provider registered for {provider_id!r}"
             ) from exc
         async with self.leases.acquire(snapshot):
-            runtime = SpeechRuntime(snapshot, recognizer, synthesizer)
+            runtime = SpeechRuntime(snapshot, recognizer, synthesizer, greeting_audio=self.greeting_audio)
             try:
                 yield runtime
             finally:

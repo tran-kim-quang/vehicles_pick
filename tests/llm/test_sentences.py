@@ -1,4 +1,5 @@
 import httpx
+import json
 import pytest
 
 from order_vehicles.booking.confirmation import confirmation_text
@@ -50,3 +51,16 @@ async def test_sse_parser_preserves_unicode_split_across_network_chunks() -> Non
         await client.aclose()
 
     assert chunks == ["Xin chào 🚕"]
+
+
+@pytest.mark.asyncio
+async def test_reply_sends_customer_transcript_as_user_message():
+    async def handler(request):
+        body = json.loads(request.content)
+        assert body["messages"][-1] == {"role": "user", "content": "xin chào"}
+        assert "user_transcript" not in body["messages"][1]["content"]
+        return httpx.Response(200, stream=ChunkedStream([b'data: [DONE]\n\n']))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = ChatCompletionsLLMAdapter("http://llm.local/v1", "model", client=client)
+        _ = [chunk async for chunk in adapter.stream_reply("reply", {"user_transcript": "xin chào"})]

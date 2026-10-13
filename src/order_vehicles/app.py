@@ -12,6 +12,7 @@ from order_vehicles.booking.fields import FieldRegistry
 from order_vehicles.booking.repository import SessionRepository
 from order_vehicles.llm.client import ChatCompletionsLLMAdapter
 from order_vehicles.llm.extractor import InformationExtractor
+from order_vehicles.llm.responder import BookingResponder
 from order_vehicles.observability.timing import TimingRecorder
 from order_vehicles.speech.api import models as model_routes
 from order_vehicles.speech.api import profiles as profile_routes
@@ -27,6 +28,9 @@ from order_vehicles.speech.providers.voicestudio.models import VoiceStudioModelM
 from order_vehicles.speech.providers.voicestudio.stt import VoiceStudioSTTAdapter
 from order_vehicles.speech.providers.voicestudio.tts import VoiceStudioTTSAdapter
 from order_vehicles.speech.providers.voicestudio.voices import VoiceStudioVoiceLibrary
+from order_vehicles.speech.providers.vieneu import VieNeuCloudTTS
+from order_vehicles.speech.greeting import load_greeting
+from order_vehicles.speech.domain.models import VoiceRef, ModelSelection
 from order_vehicles.voice import api as voice_session_routes
 from order_vehicles.voice.session import VoiceSessionService
 
@@ -51,6 +55,8 @@ def create_app(
             await llm.client.aclose()
         if owned_client:
             await owned_client.aclose()
+        if services.get("vieneu"):
+            await services["vieneu"].aclose()
 
     app = FastAPI(title="Order Vehicles Voice API", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
@@ -107,15 +113,29 @@ def _services(settings: Settings, overrides: dict[str, object]):
     leases = ResourceLeases()
     jobs = ModelJobService(models, tracking_timeout_seconds=settings.install_tracking_timeout_seconds)
     management = SpeechManagementService(repository, leases, models, voices)
+    cloud_tts = VieNeuCloudTTS(settings) if settings.tts_provider == "vieneu" else None
     async def readiness(profile):
-        await models.validate_profile(profile)
+        if cloud_tts:
+            if not settings.vieneu_api_key.get_secret_value():
+                raise SpeechError("VIENEU_NOT_CONFIGURED", "Configure OV_VIENEU_API_KEY or TTS_API_KEY")
+            response = await client.request("GET", "/dictation/readiness", params={"model_id": profile.stt.model_id, "purpose": "dictation"})
+            if not response.json().get("ready"):
+                raise SpeechError("MODEL_NOT_READY", "VoiceStudio STT is not ready")
+        else:
+            await models.validate_profile(profile)
         return True
 
     runtime = SpeechRuntimeService(
         repository,
         leases,
-        {"voicestudio": (stt, tts)},
+        {"voicestudio": (stt, tts), **({"vieneu": (stt, cloud_tts)} if cloud_tts else {})},
         readiness=readiness,
+        greeting_audio=load_greeting(settings.greeting_audio_path),
+        profile_overrides={
+            "voice_ref": VoiceRef(provider_id="vieneu", kind="preset", provider_voice_id=settings.vieneu_voice),
+            "tts": ModelSelection(engine_id="vieneu", model_id=settings.vieneu_model, purpose="tts"),
+            "language": "vi",
+        } if cloud_tts else None,
     )
     services = {
         "models": models,
@@ -126,6 +146,8 @@ def _services(settings: Settings, overrides: dict[str, object]):
         "management": management,
         "runtime": runtime,
     }
+    if cloud_tts:
+        services["vieneu"] = cloud_tts
     if settings.llm_base_url and settings.llm_model:
         adapter = ChatCompletionsLLMAdapter(
             settings.llm_base_url,
@@ -144,6 +166,7 @@ def _services(settings: Settings, overrides: dict[str, object]):
             DialogueManager(fields),
             InformationExtractor(adapter, timezone=settings.service_timezone),
             clock=lambda: datetime.now(ZoneInfo(settings.service_timezone)),
+            responder=BookingResponder(adapter, timeout=settings.llm_timeout_seconds),
             timing_recorder=timings,
         )
     return services, client

@@ -14,6 +14,7 @@ from order_vehicles.booking.models import CallSession
 from order_vehicles.booking.repository import SessionRepository
 from order_vehicles.observability.timing import TurnTiming
 from order_vehicles.speech.domain.errors import SpeechError
+from order_vehicles.speech.greeting import GREETING_TEXT
 
 from .protocol import (
     InputAudioEnd,
@@ -67,6 +68,7 @@ class VoiceSessionService:
         extractor,
         *,
         clock: Callable[[], datetime],
+        responder=None,
         timing_recorder=None,
         monotonic: Callable[[], float] = time.perf_counter,
     ) -> None:
@@ -74,6 +76,7 @@ class VoiceSessionService:
         self.repository = repository
         self.dialogue = dialogue
         self.extractor = extractor
+        self.responder = responder
         self.clock = clock
         self.timing_recorder = timing_recorder
         self.monotonic = monotonic
@@ -92,6 +95,7 @@ class VoiceSessionService:
             self.dialogue,
             self.extractor,
             clock=self.clock,
+            responder=self.responder,
             timing_recorder=self.timing_recorder,
             monotonic=self.monotonic,
             claim_session=self._claim_session,
@@ -127,6 +131,7 @@ class _VoiceConnection:
         extractor,
         *,
         clock: Callable[[], datetime],
+        responder=None,
         timing_recorder=None,
         monotonic: Callable[[], float] = time.perf_counter,
         claim_session=None,
@@ -136,6 +141,7 @@ class _VoiceConnection:
         self.repository = repository
         self.dialogue = dialogue
         self.extractor = extractor
+        self.responder = responder
         self.clock = clock
         self.timing_recorder = timing_recorder
         self.monotonic = monotonic
@@ -217,8 +223,7 @@ class _VoiceConnection:
                         session,
                         DialogueDecision(
                             kind="ask",
-                            field="name",
-                            text="Xin chào. Bạn tên là gì?",
+                            text=GREETING_TEXT,
                         ),
                         self._generation,
                     )
@@ -400,6 +405,7 @@ class _VoiceConnection:
             if generation != self._generation:
                 return
             expected_revision = session.revision
+            previous_fields = {name: field.value for name, field in session.fields.items() if field.valid}
             decision = self.dialogue.handle(session, result, self.clock())
             timing = self._timings.get(generation)
             if timing:
@@ -411,6 +417,12 @@ class _VoiceConnection:
                 await writer.json(
                     {"type": "booking.confirmed", "payload": decision.payload}
                 )
+            if self.responder is not None:
+                decision = await self.responder.respond(
+                    transcript, session.model_copy(deep=True), decision, previous_fields
+                )
+                if generation != self._generation:
+                    return
             await self._start_response(writer, runtime, session, decision, generation)
         except asyncio.CancelledError:
             raise
@@ -521,7 +533,13 @@ class _VoiceConnection:
                     }
                 )
                 started_audio = True
-            await writer.bytes(packet.data)
+            # Upstreams may return a full WAV as one PCM packet. Keep wire packets
+            # below the client's two-second queue, including cached greeting audio.
+            chunk_bytes = max(2 * packet.format.channels, packet.format.sample_rate // 10 * 2 * packet.format.channels)
+            for offset in range(0, len(packet.data), chunk_bytes):
+                if generation != self._generation:
+                    return
+                await writer.bytes(packet.data[offset:offset + chunk_bytes])
         if generation == self._generation:
             await writer.json(
                 {

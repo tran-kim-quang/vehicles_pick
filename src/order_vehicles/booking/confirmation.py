@@ -10,7 +10,10 @@ def confirmation_text(session: CallSession) -> str:
         when = "đi ngay"
     else:
         when = value("scheduled_at").strftime("%H:%M ngày %d/%m/%Y")
+    route = ""
+    if all(name in session.fields and session.fields[name].valid for name in ("pickup", "destination")):
+        route = f", từ {value('pickup')} đến {value('destination')}"
     return (
         f"Xin xác nhận: tên {value('name')}, số điện thoại {phone}, "
-        f"{when}, loại xe {value('vehicle_type')}. Thông tin có đúng không?"
+        f"{when}{route}, loại xe {value('vehicle_type')}. Thông tin có đúng không?"
     )
