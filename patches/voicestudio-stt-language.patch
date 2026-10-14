@@ -1,0 +1,137 @@
+diff --git a/backend/api/routers/capture_ws.py b/backend/api/routers/capture_ws.py
+index eefaf5f2..72ff54df 100644
+--- a/backend/api/routers/capture_ws.py
++++ b/backend/api/routers/capture_ws.py
+@@ -492,6 +492,9 @@ async def ws_transcribe(websocket: WebSocket):
+             try:
+                 text = await _transcribe_buffer(
+                     audio_chunks[:], pcm_sr=pcm_sr, dictation=not is_platform_stream,
++                    language=websocket.query_params.get("language"),
++                    engine=websocket.query_params.get("engine"),
++                    model=websocket.query_params.get("model"),
+                 )
+                 if text and text != partial_text:
+                     partial_text = text
+@@ -526,6 +529,9 @@ async def ws_transcribe(websocket: WebSocket):
+             # on PLATFORM_STREAM_PATH never get it.
+             result = await _transcribe_buffer_full(
+                 audio_chunks, pcm_sr=pcm_sr, dictation=not is_platform_stream,
++                language=websocket.query_params.get("language"),
++                engine=websocket.query_params.get("engine"),
++                model=websocket.query_params.get("model"),
+             )
+             # Dictation v2: deterministic polish so the pasted final reads
+             # like typed text (leading capital, terminal punctuation).
+@@ -1027,7 +1033,8 @@ async def _run_sherpa_offline(websocket: WebSocket, spec):
+         samples = _pcm16_to_f32(pcm)
+         if not len(samples):
+             return ""
+-        return backend._decode_offline(samples, pcm_sr)
++        language = websocket.query_params.get("language")
++        return backend._decode_offline(samples, pcm_sr, language=language)
+ 
+     async def receive():
+         nonlocal running, client_disconnected, last_audio, heard_speech
+@@ -1196,6 +1203,7 @@ def _result_text(result: dict | None) -> str:
+ 
+ async def _transcribe_buffer(
+     chunks: list[bytes], *, pcm_sr: int | None = None, dictation: bool = False,
++    language: str | None = None, engine: str | None = None, model: str | None = None,
+ ) -> str:
+     """Quick partial transcription of the current audio buffer.
+ 
+@@ -1213,8 +1221,12 @@ async def _transcribe_buffer(
+         from api.routers.dictation import dictation_transcribe_kwargs
+ 
+         def _run():
+-            backend = get_capture_asr_backend()
++            backend = get_capture_asr_backend(skip_sherpa=bool(engine))
++            if engine and (backend.id != engine or (model and getattr(backend, "_model_name", None) != model)):
++                raise ValueError("Requested STT engine/model does not match capture backend")
+             prompt_kwargs = dictation_transcribe_kwargs(backend) if dictation else {}
++            if language:
++                prompt_kwargs["language"] = language
+             result = backend.transcribe(tmp, word_timestamps=False, **prompt_kwargs)
+             return _result_text(result)
+ 
+@@ -1233,6 +1245,7 @@ async def _transcribe_buffer(
+ async def _transcribe_buffer_full(
+     chunks: list[bytes], *, pcm_sr: int | None = None, skip_sherpa: bool = False,
+     dictation: bool = False,
++    language: str | None = None, engine: str | None = None, model: str | None = None,
+ ) -> dict:
+     """Full transcription with timing info for the final result.
+ 
+@@ -1252,8 +1265,13 @@ async def _transcribe_buffer_full(
+         from api.routers.dictation import dictation_transcribe_kwargs
+ 
+         def _run():
+-            backend = get_capture_asr_backend(skip_sherpa=skip_sherpa)
++            backend = get_capture_asr_backend(skip_sherpa=skip_sherpa or bool(engine))
++            if engine and (backend.id != engine or (model and getattr(backend, "_model_name", None) != model)):
++                raise ValueError("Requested STT engine/model does not match capture backend")
+             prompt_kwargs = dictation_transcribe_kwargs(backend) if dictation else {}
++            if language:
++                prompt_kwargs["language"] = language
++            logger.info("Capture decode engine=%s model=%s language=%s", backend.id, getattr(backend, "_model_name", None), language or "auto")
+             t0 = time.perf_counter()
+             result = backend.transcribe(tmp, word_timestamps=False, **prompt_kwargs)
+             elapsed = round(time.perf_counter() - t0, 2)
+diff --git a/backend/services/asr_backend.py b/backend/services/asr_backend.py
+index be476ea7..8d506e27 100644
+--- a/backend/services/asr_backend.py
++++ b/backend/services/asr_backend.py
+@@ -2155,10 +2155,20 @@ class SherpaDictationBackend(ASRBackend):
+             text = self._decode_offline(samples, sr)
+         return _sherpa_result(text, samples, sr)
+ 
+-    def _decode_offline(self, samples, sr) -> str:
+-        s = self._rec.create_stream()
++    def _decode_offline(self, samples, sr, *, language=None) -> str:
++        rec = self._rec
++        if language and self._spec.kind == "offline-whisper":
++            with self._rec_lock:
++                if not hasattr(self, "_language_recognizers"):
++                    self._language_recognizers = {}
++                if language not in self._language_recognizers:
++                    from services import sherpa_dictation as _sd
++                    self._language_recognizers[language] = _sd.build_offline_recognizer(self._spec, language=language)
++                    logger.info("Whisper dictation language pinned: %s", language)
++                rec = self._language_recognizers[language]
++        s = rec.create_stream()
+         s.accept_waveform(sr, samples)
+-        self._rec.decode_stream(s)
++        rec.decode_stream(s)
+         return (s.result.text or "").strip()
+ 
+     def _decode_online_oneshot(self, samples, sr) -> str:
+@@ -2176,6 +2186,7 @@ class SherpaDictationBackend(ASRBackend):
+ 
+     def unload(self) -> None:
+         self._rec = None
++        self._language_recognizers = {}
+         import gc
+         gc.collect()
+ 
+diff --git a/backend/services/sherpa_dictation.py b/backend/services/sherpa_dictation.py
+index 2d4b0803..dd911ada 100644
+--- a/backend/services/sherpa_dictation.py
++++ b/backend/services/sherpa_dictation.py
+@@ -401,7 +401,7 @@ def is_installed(spec: SherpaModelSpec) -> bool:
+ # ── Recognizers ──────────────────────────────────────────────────────────────
+ 
+ 
+-def build_offline_recognizer(spec: SherpaModelSpec, *, download: bool = True):
++def build_offline_recognizer(spec: SherpaModelSpec, *, download: bool = True, language: str = ""):
+     """Construct an ``OfflineRecognizer`` for an offline transducer/whisper model."""
+     import sherpa_onnx
+ 
+@@ -430,7 +430,7 @@ def build_offline_recognizer(spec: SherpaModelSpec, *, download: bool = True):
+             tokens=p("tokens"),
+             num_threads=_threads_for(spec),
+             provider=_PROVIDER,
+-            language="",          # auto-detect
++            language=language,
+             task="transcribe",
+         )
+     raise ValueError(f"{spec.id} is not an offline model (kind={spec.kind})")

@@ -2,6 +2,10 @@
 
 ## Chuẩn bị
 
+Profile dùng large-v3: `stt.engine_id=faster-whisper`, `stt.model_id=Systran/faster-whisper-large-v3`, `language=vi`. Không dùng tên hiển thị `Whisper large-v3` làm ID. Backend chọn Faster-Whisper với cùng model trong ASR; patch WebSocket truyền language vào cả partial/final, bỏ qua sherpa khi engine được chỉ định và báo lỗi nếu engine/model thực tế không khớp.
+
+STT tiếng Việt: project gửi `language=vi` và model ID trong WebSocket. Bản VoiceStudio gốc bỏ qua language trên đường sherpa offline; áp dụng `git -C VoiceStudio apply ../patches/voicestudio-stt-language.patch` từ thư mục repo đặt xe (chỉ cho clone chưa áp dụng patch), rồi khởi động lại VoiceStudio. Patch đặt ngôn ngữ theo từng stream Whisper, không đổi lựa chọn mặc định của phiên khác. `language=vi` trong profile TTS đơn thuần không đủ để ép STT nếu chưa có patch backend.
+
 VoiceStudio phải chạy đúng revision đã review:
 
 ```text

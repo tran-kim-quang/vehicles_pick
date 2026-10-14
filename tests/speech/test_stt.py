@@ -67,6 +67,8 @@ async def test_summary_is_authoritative(tmp_path) -> None:
 
     events = [event async for event in adapter.stream_transcribe(byte_frames(b"\x00\x00"), config())]
     summary = [event for event in events if event.final_kind == "summary"][0]
+    assert "language=vi" in connector.urls[0]
+    assert "model=vi-model" in connector.urls[0]
 
     assert summary.text == "Nam muốn đặt xe"
     assert json.loads(connector.connections[0].sent[-1]) == {"type": "input_audio.end"}
@@ -128,4 +130,14 @@ async def test_sherpa_model_query_is_explicit(tmp_path) -> None:
 
     _ = [event async for event in VoiceStudioSTTAdapter(client).stream_transcribe(byte_frames(), config(engine="sherpa-onnx"))]
 
-    assert connector.urls == ["ws://127.0.0.1:3900/v1/audio/transcriptions/stream?pcm=1&sr=16000&model=vi-model"]
+    assert connector.urls == ["ws://127.0.0.1:3900/v1/audio/transcriptions/stream?pcm=1&sr=16000&language=vi&model=vi-model"]
+
+
+@pytest.mark.asyncio
+async def test_faster_whisper_route_pins_engine_model_and_vietnamese(tmp_path):
+    connector = ScriptedConnector([[{"type": "final", "final_kind": "summary", "text": "xin chào", "engine": "faster-whisper"}]])
+    client = VoiceStudioClient(Settings(), websocket_connector=connector)
+    selected = config(engine="faster-whisper").model_copy(update={"stt": ModelSelection(engine_id="faster-whisper", model_id="Systran/faster-whisper-large-v3", purpose="stt_stream")})
+    _ = [event async for event in VoiceStudioSTTAdapter(client).stream_transcribe(byte_frames(), selected)]
+    assert "engine=faster-whisper" in connector.urls[0]
+    assert "language=vi" in connector.urls[0]

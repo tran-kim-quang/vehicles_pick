@@ -30,7 +30,7 @@ class VoiceStudioSTTAdapter:
             "POST",
             "/v1/audio/transcriptions",
             files={"file": ("audio.wav", wav, "audio/wav")},
-            data={"model": config.stt.model_id or config.stt.engine_id},
+            data={"model": config.stt.model_id or config.stt.engine_id, "language": config.language},
         )
         payload = response.json()
         actual = payload.get("engine") or payload.get("model")
@@ -47,8 +47,12 @@ class VoiceStudioSTTAdapter:
         self, frames: AsyncIterator[bytes], config: SpeechConfig
     ) -> AsyncIterator[TranscriptionEvent]:
         query: dict[str, str] = {"pcm": "1", "sr": "16000"}
-        if config.stt.engine_id == "sherpa-onnx" and config.stt.model_id:
+        if config.language and config.language.lower() != "auto":
+            query["language"] = config.language
+        if config.stt.model_id:
             query["model"] = config.stt.model_id
+        if config.stt.engine_id == "faster-whisper":
+            query["engine"] = "faster-whisper"
         path = f"/v1/audio/transcriptions/stream?{urlencode(query)}"
         url = self.client.websocket_url(path)
         sender: asyncio.Task[None] | None = None
